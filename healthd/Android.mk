@@ -3,7 +3,7 @@
 LOCAL_PATH := $(call my-dir)
 
 include $(CLEAR_VARS)
-LOCAL_SRC_FILES := healthd_board_default.cpp
+LOCAL_SRC_FILES := healthd_board_default.cpp healthd_msm_alarm.cpp
 LOCAL_MODULE := libhealthd.default
 LOCAL_CFLAGS := -Werror
 include $(BUILD_STATIC_LIBRARY)
@@ -44,6 +44,12 @@ endif
 ifeq ($(strip $(BOARD_CHARGER_ENABLE_SUSPEND)),true)
 LOCAL_CFLAGS += -DCHARGER_ENABLE_SUSPEND
 endif
+
+ifeq ($(strip $(BOARD_CHARGER_SHOW_PERCENTAGE)),true)
+LOCAL_CFLAGS += -DCHARGER_SHOW_PERCENTAGE
+endif
+
+LOCAL_CFLAGS += -DCHARGER_SHOW_PERCENTAGE
 
 LOCAL_C_INCLUDES := bootable/recovery
 
