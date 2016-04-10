@@ -14,26 +14,21 @@
  * limitations under the License.
  */
 
-#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
-#include <stdarg.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 
-#include "init.h"
-#include "parser.h"
+#include "action.h"
 #include "init_parser.h"
 #include "log.h"
-#include "property_service.h"
+#include "parser.h"
+#include "service.h"
 #include "util.h"
 
 #include <cutils/iosched_policy.h>
 #include <cutils/list.h>
+#include <android-base/stringprintf.h>
+
 
 static list_declare(service_list);
 static list_declare(action_list);
@@ -326,34 +321,12 @@ int expand_props(char *dst, const char *src, int dst_size)
     *dst_ptr = '\0';
     return 0;
 
-err_nospace:
-    ERROR("destination buffer overflow while expanding '%s'\n", src);
-err:
-    return -1;
+Parser::Parser() {
 }
 
-static void parse_import(struct parse_state *state, int nargs, char **args)
-{
-    struct listnode *import_list = (listnode*) state->priv;
-    char conf_file[PATH_MAX];
-    int ret;
-
-    if (nargs != 2) {
-        ERROR("single argument needed for import\n");
-        return;
-    }
-
-    ret = expand_props(conf_file, args[1], sizeof(conf_file));
-    if (ret) {
-        ERROR("error while handling import on line '%d' in '%s'\n",
-              state->line, state->filename);
-        return;
-    }
-
-    struct import* import = (struct import*) calloc(1, sizeof(struct import));
-    import->filename = strdup(conf_file);
-    list_add_tail(import_list, &import->list);
-    INFO("Added '%s' to import list\n", import->filename);
+Parser& Parser::GetInstance() {
+    static Parser instance;
+    return instance;
 }
 
 static void parse_new_section(struct parse_state *state, int kw,
@@ -384,239 +357,114 @@ static void parse_new_section(struct parse_state *state, int kw,
     state->parse_line = parse_line_no_op;
 }
 
-static void parse_config(const char *fn, const std::string& data)
-{
-    struct listnode import_list;
-    struct listnode *node;
-    char *args[INIT_PARSER_MAXARGS];
+void Parser::AddSectionParser(const std::string& name,
+                              std::unique_ptr<SectionParser> parser) {
+    section_parsers_[name] = std::move(parser);
+}
 
-    int nargs = 0;
+void Parser::ParseData(const std::string& filename, const std::string& data) {
+    //TODO: Use a parser with const input and remove this copy
+    std::vector<char> data_copy(data.begin(), data.end());
+    data_copy.push_back('\0');
 
     parse_state state;
-    state.filename = fn;
+    state.filename = filename.c_str();
     state.line = 0;
-    state.ptr = strdup(data.c_str());  // TODO: fix this code!
+    state.ptr = &data_copy[0];
     state.nexttoken = 0;
-    state.parse_line = parse_line_no_op;
 
-    list_init(&import_list);
-    state.priv = &import_list;
+    SectionParser* section_parser = nullptr;
+    std::vector<std::string> args;
 
     for (;;) {
         switch (next_token(&state)) {
         case T_EOF:
-            state.parse_line(&state, 0, 0);
-            goto parser_done;
+            if (section_parser) {
+                section_parser->EndSection();
+            }
+            return;
         case T_NEWLINE:
             state.line++;
-            if (nargs) {
-                int kw = lookup_keyword(args[0]);
-                if (kw_is(kw, SECTION)) {
-                    state.parse_line(&state, 0, 0);
-                    parse_new_section(&state, kw, nargs, args);
-                } else {
-                    state.parse_line(&state, nargs, args);
-                }
-                nargs = 0;
+            if (args.empty()) {
+                break;
             }
+            if (section_parsers_.count(args[0])) {
+                if (section_parser) {
+                    section_parser->EndSection();
+                }
+                section_parser = section_parsers_[args[0]].get();
+                std::string ret_err;
+                if (!section_parser->ParseSection(args, &ret_err)) {
+                    parse_error(&state, "%s\n", ret_err.c_str());
+                    section_parser = nullptr;
+                }
+            } else if (section_parser) {
+                std::string ret_err;
+                if (!section_parser->ParseLineSection(args, state.filename,
+                                                      state.line, &ret_err)) {
+                    parse_error(&state, "%s\n", ret_err.c_str());
+                }
+            }
+            args.clear();
             break;
         case T_TEXT:
-            if (nargs < INIT_PARSER_MAXARGS) {
-                args[nargs++] = state.text;
-            }
+            args.emplace_back(state.text);
             break;
         }
     }
-
-parser_done:
-    list_for_each(node, &import_list) {
-         struct import *import = node_to_item(node, struct import, list);
-         int ret;
-
-         ret = init_parse_config_file(import->filename);
-         if (ret)
-             ERROR("could not import file '%s' from '%s'\n",
-                   import->filename, fn);
-    }
 }
 
-int init_parse_config_file(const char* path) {
-    INFO("Parsing %s...\n", path);
+bool Parser::ParseConfigFile(const std::string& path) {
+    INFO("Parsing file %s...\n", path.c_str());
     Timer t;
     std::string data;
-    if (!read_file(path, &data)) {
-        return -1;
+    if (!read_file(path.c_str(), &data)) {
+        return false;
     }
 
     data.push_back('\n'); // TODO: fix parse_config.
-    parse_config(path, data);
-    dump_parser_state();
+    ParseData(path, data);
+    for (const auto& sp : section_parsers_) {
+        sp.second->EndFile(path);
+    }
 
-    NOTICE("(Parsing %s took %.2fs.)\n", path, t.duration());
-    return 0;
+    // Turning this on and letting the INFO logging be discarded adds 0.2s to
+    // Nexus 9 boot time, so it's disabled by default.
+    if (false) DumpState();
+
+    NOTICE("(Parsing %s took %.2fs.)\n", path.c_str(), t.duration());
+    return true;
 }
 
-static int valid_name(const char *name)
-{
-    if (strlen(name) > 16) {
-        return 0;
+bool Parser::ParseConfigDir(const std::string& path) {
+    INFO("Parsing directory %s...\n", path.c_str());
+    std::unique_ptr<DIR, int(*)(DIR*)> config_dir(opendir(path.c_str()), closedir);
+    if (!config_dir) {
+        ERROR("Could not import directory '%s'\n", path.c_str());
+        return false;
     }
-    while (*name) {
-        if (!isalnum(*name) && (*name != '_') && (*name != '-')) {
-            return 0;
-        }
-        name++;
-    }
-    return 1;
-}
-
-struct service *service_find_by_name(const char *name)
-{
-    struct listnode *node;
-    struct service *svc;
-    list_for_each(node, &service_list) {
-        svc = node_to_item(node, struct service, slist);
-        if (!strcmp(svc->name, name)) {
-            return svc;
-        }
-    }
-    return 0;
-}
-
-struct service *service_find_by_pid(pid_t pid)
-{
-    struct listnode *node;
-    struct service *svc;
-    list_for_each(node, &service_list) {
-        svc = node_to_item(node, struct service, slist);
-        if (svc->pid == pid) {
-            return svc;
-        }
-    }
-    return 0;
-}
-
-struct service *service_find_by_keychord(int keychord_id)
-{
-    struct listnode *node;
-    struct service *svc;
-    list_for_each(node, &service_list) {
-        svc = node_to_item(node, struct service, slist);
-        if (svc->keychord_id == keychord_id) {
-            return svc;
-        }
-    }
-    return 0;
-}
-
-void service_for_each(void (*func)(struct service *svc))
-{
-    struct listnode *node;
-    struct service *svc;
-    list_for_each(node, &service_list) {
-        svc = node_to_item(node, struct service, slist);
-        func(svc);
-    }
-}
-
-void service_for_each_class(const char *classname,
-                            void (*func)(struct service *svc))
-{
-    struct listnode *node;
-    struct service *svc;
-    list_for_each(node, &service_list) {
-        svc = node_to_item(node, struct service, slist);
-        if (!strcmp(svc->classname, classname)) {
-            func(svc);
-        }
-    }
-}
-
-void service_for_each_flags(unsigned matchflags,
-                            void (*func)(struct service *svc))
-{
-    struct listnode *node;
-    struct service *svc;
-    list_for_each(node, &service_list) {
-        svc = node_to_item(node, struct service, slist);
-        if (svc->flags & matchflags) {
-            func(svc);
-        }
-    }
-}
-
-void action_for_each_trigger(const char *trigger,
-                             void (*func)(struct action *act))
-{
-    struct listnode *node, *node2;
-    struct action *act;
-    struct trigger *cur_trigger;
-
-    list_for_each(node, &action_list) {
-        act = node_to_item(node, struct action, alist);
-        list_for_each(node2, &act->triggers) {
-            cur_trigger = node_to_item(node2, struct trigger, nlist);
-            if (!strcmp(cur_trigger->name, trigger)) {
-                func(act);
+    dirent* current_file;
+    while ((current_file = readdir(config_dir.get()))) {
+        std::string current_path =
+            android::base::StringPrintf("%s/%s", path.c_str(), current_file->d_name);
+        // Ignore directories and only process regular files.
+        if (current_file->d_type == DT_REG) {
+            if (!ParseConfigFile(current_path)) {
+                ERROR("could not import file '%s'\n", current_path.c_str());
             }
         }
     }
+    return true;
 }
 
-
-void queue_property_triggers(const char *name, const char *value)
-{
-    struct listnode *node, *node2;
-    struct action *act;
-    struct trigger *cur_trigger;
-    bool match;
-    int name_length;
-
-    list_for_each(node, &action_list) {
-        act = node_to_item(node, struct action, alist);
-        match = !name;
-        list_for_each(node2, &act->triggers) {
-            cur_trigger = node_to_item(node2, struct trigger, nlist);
-            if (!strncmp(cur_trigger->name, "property:", strlen("property:"))) {
-                const char *test = cur_trigger->name + strlen("property:");
-                if (!match) {
-                    name_length = strlen(name);
-                    if (!strncmp(name, test, name_length) &&
-                        test[name_length] == '=' &&
-                        (!strcmp(test + name_length + 1, value) ||
-                        !strcmp(test + name_length + 1, "*"))) {
-                        match = true;
-                        continue;
-                    }
-                }
-                const char* equals = strchr(test, '=');
-                if (equals) {
-                    char prop_name[PROP_NAME_MAX + 1];
-                    char value[PROP_VALUE_MAX];
-                    int length = equals - test;
-                    if (length <= PROP_NAME_MAX) {
-                        int ret;
-                        memcpy(prop_name, test, length);
-                        prop_name[length] = 0;
-
-                        /* does the property exist, and match the trigger value? */
-                        ret = property_get(prop_name, value);
-                        if (ret > 0 && (!strcmp(equals + 1, value) ||
-                                        !strcmp(equals + 1, "*"))) {
-                            continue;
-                        }
-                    }
-                }
-            }
-            match = false;
-            break;
-        }
-        if (match) {
-            action_add_queue_tail(act);
-        }
+bool Parser::ParseConfig(const std::string& path) {
+    if (is_dir(path.c_str())) {
+        return ParseConfigDir(path);
     }
+    return ParseConfigFile(path);
 }
 
+<<<<<<< HEAD
 void queue_all_property_triggers()
 {
     queue_property_triggers(NULL, NULL);
@@ -1018,4 +866,9 @@ static void parse_line_action(struct parse_state* state, int nargs, char **args)
     cmd->nargs = nargs;
     memcpy(cmd->args, args, sizeof(char*) * nargs);
     list_add_tail(&act->commands, &cmd->clist);
+}
+
+void Parser::DumpState() const {
+    ServiceManager::GetInstance().DumpState();
+    ActionManager::GetInstance().DumpState();
 }

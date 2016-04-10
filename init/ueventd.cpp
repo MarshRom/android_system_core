@@ -22,7 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <base/stringprintf.h>
+#include <android-base/stringprintf.h>
 #include <private/android_filesystem_config.h>
 #include <selinux/selinux.h>
 
@@ -61,11 +61,10 @@ int ueventd_main(int argc, char **argv)
     cb.func_log = selinux_klog_callback;
     selinux_set_callback(SELINUX_CB_LOG, cb);
 
-    char hardware[PROP_VALUE_MAX];
-    property_get("ro.hardware", hardware);
+    std::string hardware = property_get("ro.hardware");
 
     ueventd_parse_config_file("/ueventd.rc");
-    ueventd_parse_config_file(android::base::StringPrintf("/ueventd.%s.rc", hardware).c_str());
+    ueventd_parse_config_file(android::base::StringPrintf("/ueventd.%s.rc", hardware.c_str()).c_str());
 
     property_get("ro.boot.bootdevice", boot_device);
 

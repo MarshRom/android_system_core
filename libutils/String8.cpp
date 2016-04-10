@@ -19,13 +19,15 @@
 
 #include <utils/String8.h>
 
+#include <utils/Compat.h>
 #include <utils/Log.h>
 #include <utils/Unicode.h>
-#include <utils/SharedBuffer.h>
 #include <utils/String16.h>
 #include <utils/threads.h>
 
 #include <ctype.h>
+
+#include "SharedBuffer.h"
 
 /*
  * Functions outside android is below the namespace android, since they use
@@ -213,6 +215,11 @@ String8::~String8()
     SharedBuffer::bufferFromData(mString)->release();
 }
 
+size_t String8::length() const
+{
+    return SharedBuffer::sizeFromData(mString)-1;
+}
+
 String8 String8::format(const char* fmt, ...)
 {
     va_list args;
@@ -355,7 +362,7 @@ status_t String8::appendFormatV(const char* fmt, va_list args)
 status_t String8::real_append(const char* other, size_t otherLen)
 {
     const size_t myLen = bytes();
-    
+
     SharedBuffer* buf = SharedBuffer::bufferFromData(mString)
         ->editResize(myLen+otherLen+1);
     if (buf) {

@@ -25,7 +25,8 @@ extern "C" {
 #include <crypto_scrypt.h>
 }
 
-#include <base/memory.h>
+
+#include <android-base/memory.h>
 #include <UniquePtr.h>
 #include <gatekeeper/gatekeeper.h>
 
@@ -180,4 +181,3 @@ private:
 }
 
 #endif // SOFT_GATEKEEPER_H_
-

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#define TRACE_TAG TRACE_AUTH
+#define TRACE_TAG AUTH
 
 #include "sysdeps.h"
 #include "adb_auth.h"
@@ -43,7 +43,8 @@
 #include "mincrypt/rsa.h"
 #undef RSA_verify
 
-#include <base/strings.h>
+#include <android-base/errors.h>
+#include <android-base/strings.h>
 #include <cutils/list.h>
 
 #include <openssl/evp.h>
@@ -157,29 +158,29 @@ static int write_public_keyfile(RSA *private_key, const char *private_key_path)
 {
     RSAPublicKey pkey;
     FILE *outfile = NULL;
-    char path[PATH_MAX], info[MAX_PAYLOAD];
+    char path[PATH_MAX], info[MAX_PAYLOAD_V1];
     uint8_t* encoded = nullptr;
     size_t encoded_length;
     int ret = 0;
 
     if (snprintf(path, sizeof(path), "%s.pub", private_key_path) >=
         (int)sizeof(path)) {
-        D("Path too long while writing public key\n");
+        D("Path too long while writing public key");
         return 0;
     }
 
     if (!RSA_to_RSAPublicKey(private_key, &pkey)) {
-        D("Failed to convert to publickey\n");
+        D("Failed to convert to publickey");
         return 0;
     }
 
     outfile = fopen(path, "w");
     if (!outfile) {
-        D("Failed to open '%s'\n", path);
+        D("Failed to open '%s'", path);
         return 0;
     }
 
-    D("Writing public key to '%s'\n", path);
+    D("Writing public key to '%s'", path);
 
 #if defined(OPENSSL_IS_BORINGSSL)
     if (!EVP_EncodedLength(&encoded_length, sizeof(pkey))) {
@@ -226,10 +227,10 @@ static int generate_key(const char *file)
     FILE *f = NULL;
     int ret = 0;
 
-    D("generate_key '%s'\n", file);
+    D("generate_key '%s'", file);
 
     if (!pkey || !exponent || !rsa) {
-        D("Failed to allocate key\n");
+        D("Failed to allocate key");
         goto out;
     }
 
@@ -241,7 +242,7 @@ static int generate_key(const char *file)
 
     f = fopen(file, "w");
     if (!f) {
-        D("Failed to open '%s'\n", file);
+        D("Failed to open '%s'", file);
         umask(old_mask);
         goto out;
     }
@@ -249,12 +250,12 @@ static int generate_key(const char *file)
     umask(old_mask);
 
     if (!PEM_write_PrivateKey(f, pkey, NULL, NULL, 0, NULL, NULL)) {
-        D("Failed to write key\n");
+        D("Failed to write key");
         goto out;
     }
 
     if (!write_public_keyfile(rsa, file)) {
-        D("Failed to write public key\n");
+        D("Failed to write public key");
         goto out;
     }
 
@@ -271,11 +272,11 @@ out:
 
 static int read_key(const char *file, struct listnode *list)
 {
-    D("read_key '%s'\n", file);
+    D("read_key '%s'", file);
 
     FILE* fp = fopen(file, "r");
     if (!fp) {
-        D("Failed to open '%s': %s\n", file, strerror(errno));
+        D("Failed to open '%s': %s", file, strerror(errno));
         return 0;
     }
 
@@ -283,7 +284,7 @@ static int read_key(const char *file, struct listnode *list)
     key->rsa = RSA_new();
 
     if (!PEM_read_RSAPrivateKey(fp, &key->rsa, NULL, NULL)) {
-        D("Failed to read key\n");
+        D("Failed to read key");
         fclose(fp);
         RSA_free(key->rsa);
         delete key;
@@ -301,11 +302,19 @@ static int get_user_keyfilepath(char *filename, size_t len)
     char android_dir[PATH_MAX];
     struct stat buf;
 #ifdef _WIN32
-    char path[PATH_MAX];
+    std::string home_str;
     home = getenv("ANDROID_SDK_HOME");
     if (!home) {
-        SHGetFolderPath(NULL, CSIDL_PROFILE, NULL, 0, path);
-        home = path;
+        WCHAR path[MAX_PATH];
+        const HRESULT hr = SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, path);
+        if (FAILED(hr)) {
+            D("SHGetFolderPathW failed: %s", android::base::SystemErrorCodeToString(hr).c_str());
+            return -1;
+        }
+        if (!android::base::WideToUTF8(path, &home_str)) {
+            return -1;
+        }
+        home = home_str.c_str();
     }
     format = "%s\\%s";
 #else
@@ -315,7 +324,7 @@ static int get_user_keyfilepath(char *filename, size_t len)
     format = "%s/%s";
 #endif
 
-    D("home '%s'\n", home);
+    D("home '%s'", home);
 
     if (snprintf(android_dir, sizeof(android_dir), format, home,
                         ANDROID_PATH) >= (int)sizeof(android_dir))
@@ -343,11 +352,11 @@ static int get_user_key(struct listnode *list)
         return 0;
     }
 
-    D("user key '%s'\n", path);
+    D("user key '%s'", path);
 
     if (stat(path, &buf) == -1) {
         if (!generate_key(path)) {
-            D("Failed to generate new key\n");
+            D("Failed to generate new key");
             return 0;
         }
     }
@@ -361,9 +370,9 @@ static void get_vendor_keys(struct listnode* key_list) {
         return;
     }
 
-    for (auto& path : android::base::Split(adb_keys_path, ENV_PATH_SEPARATOR_STR)) {
+    for (const auto& path : android::base::Split(adb_keys_path, ENV_PATH_SEPARATOR_STR)) {
         if (!read_key(path.c_str(), key_list)) {
-            D("Failed to read '%s'\n", path.c_str());
+            D("Failed to read '%s'", path.c_str());
         }
     }
 }
@@ -375,7 +384,7 @@ int adb_auth_sign(void *node, const unsigned char* token, size_t token_size,
     struct adb_private_key *key = node_to_item(node, struct adb_private_key, node);
 
     if (token_size != TOKEN_SIZE) {
-        D("Unexpected token size %zd\n", token_size);
+        D("Unexpected token size %zd", token_size);
         return 0;
     }
 
@@ -383,7 +392,7 @@ int adb_auth_sign(void *node, const unsigned char* token, size_t token_size,
         return 0;
     }
 
-    D("adb_auth_sign len=%d\n", len);
+    D("adb_auth_sign len=%d", len);
     return (int)len;
 }
 
@@ -420,15 +429,18 @@ int adb_auth_get_userkey(unsigned char *data, size_t len)
     strcat(path, ".pub");
 
     // TODO(danalbert): ReadFileToString
+    // Note that on Windows, load_file() does not do CR/LF translation, but
+    // ReadFileToString() uses the C Runtime which uses CR/LF translation by
+    // default (by is overridable with _setmode()).
     unsigned size;
     char* file_data = reinterpret_cast<char*>(load_file(path, &size));
     if (file_data == nullptr) {
-        D("Can't load '%s'\n", path);
+        D("Can't load '%s'", path);
         return 0;
     }
 
     if (len < (size_t)(size + 1)) {
-        D("%s: Content too large ret=%d\n", path, size);
+        D("%s: Content too large ret=%d", path, size);
         free(file_data);
         return 0;
     }
@@ -442,7 +454,6 @@ int adb_auth_get_userkey(unsigned char *data, size_t len)
 }
 
 int adb_auth_keygen(const char* filename) {
-    adb_trace_mask |= (1 << TRACE_AUTH);
     return (generate_key(filename) == 0);
 }
 
@@ -450,13 +461,13 @@ void adb_auth_init(void)
 {
     int ret;
 
-    D("adb_auth_init\n");
+    D("adb_auth_init");
 
     list_init(&key_list);
 
     ret = get_user_key(&key_list);
     if (!ret) {
-        D("Failed to get user key\n");
+        D("Failed to get user key");
         return;
     }
 

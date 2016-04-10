@@ -18,4 +18,6 @@ LOCAL_MODULE := sdcard
 LOCAL_CFLAGS := -Wall -Wno-unused-parameter -Werror
 LOCAL_STATIC_LIBRARIES := libsdcard
 LOCAL_SHARED_LIBRARIES := libc libcutils
+LOCAL_SHARED_LIBRARIES += liblog libpackagelistparser
+
 include $(BUILD_EXECUTABLE)

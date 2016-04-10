@@ -17,8 +17,8 @@
 
 #define LOG_TAG "healthd"
 
-#include "healthd.h"
-#include "BatteryMonitor.h"
+#include <healthd/healthd.h>
+#include <healthd/BatteryMonitor.h>
 
 #include <dirent.h>
 #include <errno.h>
@@ -27,11 +27,11 @@
 #include <stdlib.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <memory>
 
 #include <batteryservice/BatteryService.h>
 #include <cutils/klog.h>
 #include <cutils/properties.h>
-#include <log/log_read.h>
 #include <utils/Errors.h>
 #include <utils/String8.h>
 #include <utils/Vector.h>
@@ -56,6 +56,31 @@ static int mapSysfsString(const char* str,
             return map[i].val;
 
     return -1;
+}
+
+static void initBatteryProperties(BatteryProperties* props) {
+    props->chargerAcOnline = false;
+    props->chargerUsbOnline = false;
+    props->chargerWirelessOnline = false;
+    props->maxChargingCurrent = 0;
+    props->batteryStatus = BATTERY_STATUS_UNKNOWN;
+    props->batteryHealth = BATTERY_HEALTH_UNKNOWN;
+    props->batteryPresent = false;
+    props->batteryLevel = 0;
+    props->batteryVoltage = 0;
+    props->batteryTemperature = 0;
+    props->batteryCurrent = 0;
+    props->batteryCycleCount = 0;
+    props->batteryFullCharge = 0;
+    props->dockBatteryStatus = BATTERY_STATUS_UNKNOWN;
+    props->dockBatteryHealth = BATTERY_HEALTH_UNKNOWN;
+    props->chargerDockAcOnline = false;
+    props->batteryTechnology.clear();
+}
+
+BatteryMonitor::BatteryMonitor() : mHealthdConfig(nullptr), mBatteryDevicePresent(false),
+    mAlwaysPluggedDevice(false), mBatteryFixedCapacity(0), mBatteryFixedTemperature(0) {
+    initBatteryProperties(&props);
 }
 
 int BatteryMonitor::getBatteryStatus(const char* status) {
@@ -136,10 +161,14 @@ BatteryMonitor::PowerSupplyType BatteryMonitor::readPowerSupplyType(const String
             { "Mains", ANDROID_POWER_SUPPLY_TYPE_AC },
             { "USB", ANDROID_POWER_SUPPLY_TYPE_USB },
             { "USB_DCP", ANDROID_POWER_SUPPLY_TYPE_AC },
+            { "USB_HVDCP", ANDROID_POWER_SUPPLY_TYPE_AC },
             { "USB_CDP", ANDROID_POWER_SUPPLY_TYPE_AC },
             { "USB_ACA", ANDROID_POWER_SUPPLY_TYPE_AC },
             { "USB_HVDCP", ANDROID_POWER_SUPPLY_TYPE_AC },
             { "USB_HVDCP_3", ANDROID_POWER_SUPPLY_TYPE_AC },
+            { "USB_C", ANDROID_POWER_SUPPLY_TYPE_AC },
+            { "USB_PD", ANDROID_POWER_SUPPLY_TYPE_AC },
+            { "USB_PD_DRP", ANDROID_POWER_SUPPLY_TYPE_USB },
             { "Wireless", ANDROID_POWER_SUPPLY_TYPE_WIRELESS },
             { "Wipower", ANDROID_POWER_SUPPLY_TYPE_WIRELESS },
             { "DockBattery", ANDROID_POWER_SUPPLY_TYPE_DOCK_BATTERY },
@@ -151,8 +180,10 @@ BatteryMonitor::PowerSupplyType BatteryMonitor::readPowerSupplyType(const String
         return ANDROID_POWER_SUPPLY_TYPE_UNKNOWN;
 
     ret = (BatteryMonitor::PowerSupplyType)mapSysfsString(buf, supplyTypeMap);
-    if (ret < 0)
+    if (ret < 0) {
+        KLOG_WARNING(LOG_TAG, "Unknown power supply type '%s'\n", buf);
         ret = ANDROID_POWER_SUPPLY_TYPE_UNKNOWN;
+    }
 
     return ret;
 }
@@ -185,15 +216,7 @@ int BatteryMonitor::getIntField(const String8& path) {
 bool BatteryMonitor::update(void) {
     bool logthis;
 
-    props.chargerAcOnline = false;
-    props.chargerUsbOnline = false;
-    props.chargerWirelessOnline = false;
-    props.chargerDockAcOnline = false;
-    props.batteryStatus = BATTERY_STATUS_UNKNOWN;
-    props.batteryHealth = BATTERY_HEALTH_UNKNOWN;
-    props.maxChargingCurrent = 0;
-    props.dockBatteryStatus = BATTERY_STATUS_UNKNOWN;
-    props.dockBatteryHealth = BATTERY_HEALTH_UNKNOWN;
+    initBatteryProperties(&props);
 
     if (!mHealthdConfig->batteryPresentPath.isEmpty())
         props.batteryPresent = getBooleanField(mHealthdConfig->batteryPresentPath);
@@ -204,6 +227,15 @@ bool BatteryMonitor::update(void) {
         mBatteryFixedCapacity :
         getIntField(mHealthdConfig->batteryCapacityPath);
     props.batteryVoltage = getIntField(mHealthdConfig->batteryVoltagePath) / 1000;
+
+    if (!mHealthdConfig->batteryCurrentNowPath.isEmpty())
+        props.batteryCurrent = getIntField(mHealthdConfig->batteryCurrentNowPath) / 1000;
+
+    if (!mHealthdConfig->batteryFullChargePath.isEmpty())
+        props.batteryFullCharge = getIntField(mHealthdConfig->batteryFullChargePath);
+
+    if (!mHealthdConfig->batteryCycleCountPath.isEmpty())
+        props.batteryCycleCount = getIntField(mHealthdConfig->batteryCycleCountPath);
 
     props.batteryTemperature = mBatteryFixedTemperature ?
         mBatteryFixedTemperature :
@@ -331,6 +363,7 @@ bool BatteryMonitor::update(void) {
         char dmesgline[256];
         char dmesglinedock[256];
 
+        size_t len;
         if (props.batteryPresent) {
             snprintf(dmesgline, sizeof(dmesgline),
                  "battery [l=%d v=%d t=%s%d.%d h=%d st=%d]",
@@ -340,63 +373,30 @@ bool BatteryMonitor::update(void) {
                  abs(props.batteryTemperature % 10), props.batteryHealth,
                  props.batteryStatus);
 
+            len = strlen(dmesgline);
             if (!mHealthdConfig->batteryCurrentNowPath.isEmpty()) {
-                int c = getIntField(mHealthdConfig->batteryCurrentNowPath);
-                char b[20];
+                len += snprintf(dmesgline + len, sizeof(dmesgline) - len,
+                                " c=%d", props.batteryCurrent);
+            }
 
-                snprintf(b, sizeof(b), " c=%d", c / 1000);
-                strlcat(dmesgline, b, sizeof(dmesgline));
+            if (!mHealthdConfig->batteryFullChargePath.isEmpty()) {
+                len += snprintf(dmesgline + len, sizeof(dmesgline) - len,
+                                " fc=%d", props.batteryFullCharge);
+            }
+
+            if (!mHealthdConfig->batteryCycleCountPath.isEmpty()) {
+                len += snprintf(dmesgline + len, sizeof(dmesgline) - len,
+                                " cc=%d", props.batteryCycleCount);
             }
         } else {
-            snprintf(dmesgline, sizeof(dmesgline),
+            len = snprintf(dmesgline, sizeof(dmesgline),
                  "battery none");
         }
 
-        if (props.dockBatteryPresent) {
-            snprintf(dmesglinedock, sizeof(dmesglinedock),
-                 "dock-battery [l=%d v=%d t=%s%d.%d h=%d st=%d]",
-                 props.dockBatteryLevel, props.dockBatteryVoltage,
-                 props.dockBatteryTemperature < 0 ? "-" : "",
-                 abs(props.dockBatteryTemperature / 10),
-                 abs(props.dockBatteryTemperature % 10), props.dockBatteryHealth,
-                 props.dockBatteryStatus);
-
-            if (!mHealthdConfig->dockBatteryCurrentNowPath.isEmpty()) {
-                int c = getIntField(mHealthdConfig->dockBatteryCurrentNowPath);
-                char b[20];
-
-                snprintf(b, sizeof(b), " c=%d", c / 1000);
-                strlcat(dmesglinedock, b, sizeof(dmesglinedock));
-            }
-        } else {
-            snprintf(dmesglinedock, sizeof(dmesglinedock),
-                 "dock-battery none");
-        }
-
-        size_t len = strlen(dmesgline);
         snprintf(dmesgline + len, sizeof(dmesgline) - len, " chg=%s%s%s",
                  props.chargerAcOnline ? "a" : "",
                  props.chargerUsbOnline ? "u" : "",
                  props.chargerWirelessOnline ? "w" : "");
-
-        log_time realtime(CLOCK_REALTIME);
-        time_t t = realtime.tv_sec;
-        struct tm *tmp = gmtime(&t);
-        if (tmp) {
-            static const char fmt[] = " %Y-%m-%d %H:%M:%S.XXXXXXXXX UTC";
-            len = strlen(dmesgline);
-            if ((len < (sizeof(dmesgline) - sizeof(fmt) - 8)) // margin
-                    && strftime(dmesgline + len, sizeof(dmesgline) - len,
-                                fmt, tmp)) {
-                char *usec = strchr(dmesgline + len, 'X');
-                if (usec) {
-                    len = usec - dmesgline;
-                    snprintf(dmesgline + len, sizeof(dmesgline) - len,
-                             "%09u", realtime.tv_nsec);
-                    usec[9] = ' ';
-                }
-            }
-        }
 
         KLOG_WARNING(LOG_TAG, "%s\n", dmesgline);
     }
@@ -404,6 +404,17 @@ bool BatteryMonitor::update(void) {
     healthd_mode_ops->battery_update(&props);
     return props.chargerAcOnline | props.chargerUsbOnline |
             props.chargerWirelessOnline | props.chargerDockAcOnline;
+}
+
+int BatteryMonitor::getChargeStatus() {
+    int result = BATTERY_STATUS_UNKNOWN;
+    if (!mHealthdConfig->batteryStatusPath.isEmpty()) {
+        char buf[128];
+        if (readFromFile(mHealthdConfig->batteryStatusPath, buf, sizeof(buf)) > 0) {
+            result = getBatteryStatus(buf);
+        }
+    }
+    return result;
 }
 
 status_t BatteryMonitor::getProperty(int id, struct BatteryProperty *val) {
@@ -565,32 +576,19 @@ void BatteryMonitor::dumpState(int fd) {
         write(fd, vs, strlen(vs));
     }
 
-    if (mHealthdConfig->dockBatterySupported) {
-        snprintf(vs, sizeof(vs), "dock-status: %d dock-health: %d dock-present: %d\n",
-                 props.dockBatteryStatus, props.dockBatteryHealth, props.dockBatteryPresent);
+    if (!mHealthdConfig->batteryCurrentNowPath.isEmpty()) {
+        snprintf(vs, sizeof(vs), "current now: %d\n", props.batteryCurrent);
         write(fd, vs, strlen(vs));
-        snprintf(vs, sizeof(vs), "dock-level: %d dock-voltage: %d dock-temp: %d\n",
-                 props.dockBatteryLevel, props.dockBatteryVoltage,
-                 props.dockBatteryTemperature);
+    }
+
+    if (!mHealthdConfig->batteryCycleCountPath.isEmpty()) {
+        snprintf(vs, sizeof(vs), "cycle count: %d\n", props.batteryCycleCount);
         write(fd, vs, strlen(vs));
+    }
 
-        if (!mHealthdConfig->dockBatteryCurrentNowPath.isEmpty()) {
-            v = getIntField(mHealthdConfig->dockBatteryCurrentNowPath);
-            snprintf(vs, sizeof(vs), "dock-current now: %d\n", v);
-            write(fd, vs, strlen(vs));
-        }
-
-        if (!mHealthdConfig->dockBatteryCurrentAvgPath.isEmpty()) {
-            v = getIntField(mHealthdConfig->dockBatteryCurrentAvgPath);
-            snprintf(vs, sizeof(vs), "dock-current avg: %d\n", v);
-            write(fd, vs, strlen(vs));
-        }
-
-        if (!mHealthdConfig->dockBatteryChargeCounterPath.isEmpty()) {
-            v = getIntField(mHealthdConfig->dockBatteryChargeCounterPath);
-            snprintf(vs, sizeof(vs), "dock-charge counter: %d\n", v);
-            write(fd, vs, strlen(vs));
-        }
+    if (!mHealthdConfig->batteryFullChargePath.isEmpty()) {
+        snprintf(vs, sizeof(vs), "Full charge: %d\n", props.batteryFullCharge);
+        write(fd, vs, strlen(vs));
     }
 }
 
@@ -599,13 +597,13 @@ void BatteryMonitor::init(struct healthd_config *hc) {
     char pval[PROPERTY_VALUE_MAX];
 
     mHealthdConfig = hc;
-    DIR* dir = opendir(POWER_SUPPLY_SYSFS_PATH);
+    std::unique_ptr<DIR, decltype(&closedir)> dir(opendir(POWER_SUPPLY_SYSFS_PATH), closedir);
     if (dir == NULL) {
         KLOG_ERROR(LOG_TAG, "Could not open %s\n", POWER_SUPPLY_SYSFS_PATH);
     } else {
         struct dirent* entry;
 
-        while ((entry = readdir(dir))) {
+        while ((entry = readdir(dir.get()))) {
             const char* name = entry->d_name;
 
             if (!strcmp(name, ".") || !strcmp(name, ".."))
@@ -675,12 +673,28 @@ void BatteryMonitor::init(struct healthd_config *hc) {
                     }
                 }
 
+                if (mHealthdConfig->batteryFullChargePath.isEmpty()) {
+                    path.clear();
+                    path.appendFormat("%s/%s/charge_full",
+                                      POWER_SUPPLY_SYSFS_PATH, name);
+                    if (access(path, R_OK) == 0)
+                        mHealthdConfig->batteryFullChargePath = path;
+                }
+
                 if (mHealthdConfig->batteryCurrentNowPath.isEmpty()) {
                     path.clear();
                     path.appendFormat("%s/%s/current_now",
                                       POWER_SUPPLY_SYSFS_PATH, name);
                     if (access(path, R_OK) == 0)
                         mHealthdConfig->batteryCurrentNowPath = path;
+                }
+
+                if (mHealthdConfig->batteryCycleCountPath.isEmpty()) {
+                    path.clear();
+                    path.appendFormat("%s/%s/cycle_count",
+                                      POWER_SUPPLY_SYSFS_PATH, name);
+                    if (access(path, R_OK) == 0)
+                        mHealthdConfig->batteryCycleCountPath = path;
                 }
 
                 if (mHealthdConfig->batteryCurrentAvgPath.isEmpty()) {
@@ -829,7 +843,6 @@ void BatteryMonitor::init(struct healthd_config *hc) {
                 break;
             }
         }
-        closedir(dir);
     }
 
     // This indicates that there is no charger driver registered.
@@ -860,23 +873,12 @@ void BatteryMonitor::init(struct healthd_config *hc) {
             KLOG_WARNING(LOG_TAG, "BatteryTemperaturePath not found\n");
         if (mHealthdConfig->batteryTechnologyPath.isEmpty())
             KLOG_WARNING(LOG_TAG, "BatteryTechnologyPath not found\n");
-
-        if (mHealthdConfig->dockBatterySupported) {
-            if (mHealthdConfig->dockBatteryStatusPath.isEmpty())
-                KLOG_WARNING(LOG_TAG, "DockBatteryStatusPath not found\n");
-            if (mHealthdConfig->dockBatteryHealthPath.isEmpty())
-                KLOG_WARNING(LOG_TAG, "DockBatteryHealthPath not found\n");
-            if (mHealthdConfig->dockBatteryPresentPath.isEmpty())
-                KLOG_WARNING(LOG_TAG, "DockBatteryPresentPath not found\n");
-            if (mHealthdConfig->dockBatteryCapacityPath.isEmpty())
-                KLOG_WARNING(LOG_TAG, "DockBatteryCapacityPath not found\n");
-            if (mHealthdConfig->dockBatteryVoltagePath.isEmpty())
-                KLOG_WARNING(LOG_TAG, "DockBatteryVoltagePath not found\n");
-            if (mHealthdConfig->dockBatteryTemperaturePath.isEmpty())
-                KLOG_WARNING(LOG_TAG, "DockBatteryTemperaturePath not found\n");
-            if (mHealthdConfig->dockBatteryTechnologyPath.isEmpty())
-                KLOG_WARNING(LOG_TAG, "DockBatteryTechnologyPath not found\n");
-        }
+	    if (mHealthdConfig->batteryCurrentNowPath.isEmpty())
+            KLOG_WARNING(LOG_TAG, "BatteryCurrentNowPath not found\n");
+        if (mHealthdConfig->batteryFullChargePath.isEmpty())
+            KLOG_WARNING(LOG_TAG, "BatteryFullChargePath not found\n");
+        if (mHealthdConfig->batteryCycleCountPath.isEmpty())
+            KLOG_WARNING(LOG_TAG, "BatteryCycleCountPath not found\n");
     }
 
     if (property_get("ro.boot.fake_battery", pval, NULL) > 0

@@ -42,7 +42,7 @@
 #include <backtrace/Backtrace.h>
 #include <backtrace/BacktraceMap.h>
 
-#include <base/stringprintf.h>
+#include <android-base/stringprintf.h>
 #include <cutils/atomic.h>
 #include <cutils/threads.h>
 
@@ -404,17 +404,16 @@ void GetThreads(pid_t pid, std::vector<pid_t>* threads) {
   char task_path[128];
   snprintf(task_path, sizeof(task_path), "/proc/%d/task", pid);
 
-  DIR* tasks_dir = opendir(task_path);
+  std::unique_ptr<DIR, decltype(&closedir)> tasks_dir(opendir(task_path), closedir);
   ASSERT_TRUE(tasks_dir != nullptr);
   struct dirent* entry;
-  while ((entry = readdir(tasks_dir)) != nullptr) {
+  while ((entry = readdir(tasks_dir.get())) != nullptr) {
     char* end;
     pid_t tid = strtoul(entry->d_name, &end, 10);
     if (*end == '\0') {
       threads->push_back(tid);
     }
   }
-  closedir(tasks_dir);
 }
 
 TEST(libbacktrace, ptrace_threads) {
@@ -775,16 +774,29 @@ TEST(libbacktrace, format_test) {
             backtrace->FormatFrameData(&frame));
 
   // Check map name empty, but exists.
-  frame.map.start = 1;
-  frame.map.end = 1;
+  frame.pc = 0xb0020;
+  frame.map.start = 0xb0000;
+  frame.map.end = 0xbffff;
   frame.map.load_base = 0;
 #if defined(__LP64__)
-  EXPECT_EQ("#01 pc 0000000000000001  <unknown>",
+  EXPECT_EQ("#01 pc 0000000000000020  <anonymous:00000000000b0000>",
 #else
-  EXPECT_EQ("#01 pc 00000001  <unknown>",
+  EXPECT_EQ("#01 pc 00000020  <anonymous:000b0000>",
 #endif
             backtrace->FormatFrameData(&frame));
 
+  // Check map name begins with a [.
+  frame.pc = 0xc0020;
+  frame.map.start = 0xc0000;
+  frame.map.end = 0xcffff;
+  frame.map.load_base = 0;
+  frame.map.name = "[anon:thread signal stack]";
+#if defined(__LP64__)
+  EXPECT_EQ("#01 pc 0000000000000020  [anon:thread signal stack:00000000000c0000]",
+#else
+  EXPECT_EQ("#01 pc 00000020  [anon:thread signal stack:000c0000]",
+#endif
+            backtrace->FormatFrameData(&frame));
 
   // Check relative pc is set and map name is set.
   frame.pc = 0x12345679;
@@ -983,8 +995,8 @@ void RunReadTest(Backtrace* backtrace, uintptr_t read_addr) {
           << "Offset at " << i << " length " << j << " wrote too much data";
     }
   }
-  delete data;
-  delete expected;
+  delete[] data;
+  delete[] expected;
 }
 
 TEST(libbacktrace, thread_read) {
@@ -1143,7 +1155,7 @@ TEST(libbacktrace, check_unreadable_elf_local) {
   int fd = open(tmp_so_name, O_RDONLY);
   ASSERT_TRUE(fd != -1);
 
-  void* map = mmap(NULL, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  void* map = mmap(NULL, map_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
   ASSERT_TRUE(map != MAP_FAILED);
   close(fd);
   ASSERT_TRUE(unlink(tmp_so_name) != -1);
@@ -1193,7 +1205,7 @@ TEST(libbacktrace, check_unreadable_elf_remote) {
       exit(0);
     }
 
-    void* map = mmap(NULL, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    void* map = mmap(NULL, map_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
     if (map == MAP_FAILED) {
       fprintf(stderr, "Failed to map in memory: %s\n", strerror(errno));
       unlink(tmp_so_name);
@@ -1448,4 +1460,3 @@ TEST(libbacktrace, check_for_leak_remote) {
   ASSERT_EQ(waitpid(pid, nullptr, 0), pid);
 }
 #endif
-

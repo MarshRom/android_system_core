@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <memory>
 
 #include <gtest/gtest.h>
 #include <log/log.h>
@@ -74,6 +75,127 @@ TEST(logcat, buckets) {
     EXPECT_EQ(4, count);
 }
 
+TEST(logcat, year) {
+
+    if (android_log_clockid() == CLOCK_MONOTONIC) {
+        fprintf(stderr, "Skipping test, logd is monotonic time\n");
+        return;
+    }
+
+    FILE *fp;
+
+    char needle[32];
+    time_t now;
+    time(&now);
+    struct tm *ptm;
+#if !defined(_WIN32)
+    struct tm tmBuf;
+    ptm = localtime_r(&now, &tmBuf);
+#else
+    ptm = localtime(&&now);
+#endif
+    strftime(needle, sizeof(needle), "[ %Y-", ptm);
+
+    ASSERT_TRUE(NULL != (fp = popen(
+      "logcat -v long -v year -b all -t 3 2>/dev/null",
+      "r")));
+
+    char buffer[5120];
+
+    int count = 0;
+
+    while (fgets(buffer, sizeof(buffer), fp)) {
+        if (!strncmp(buffer, needle, strlen(needle))) {
+            ++count;
+        }
+    }
+
+    pclose(fp);
+
+    ASSERT_EQ(3, count);
+}
+
+// Return a pointer to each null terminated -v long time field.
+char *fgetLongTime(char *buffer, size_t buflen, FILE *fp) {
+    while (fgets(buffer, buflen, fp)) {
+        char *cp = buffer;
+        if (*cp != '[') {
+            continue;
+        }
+        while (*++cp == ' ') {
+            ;
+        }
+        char *ep = cp;
+        while (isdigit(*ep)) {
+            ++ep;
+        }
+        if ((*ep != '-') && (*ep != '.')) {
+           continue;
+        }
+        // Find PID field
+        while (((ep = strchr(ep, ':'))) && (*++ep != ' ')) {
+            ;
+        }
+        if (!ep) {
+            continue;
+        }
+        ep -= 7;
+        *ep = '\0';
+        return cp;
+    }
+    return NULL;
+}
+
+TEST(logcat, tz) {
+
+    if (android_log_clockid() == CLOCK_MONOTONIC) {
+        fprintf(stderr, "Skipping test, logd is monotonic time\n");
+        return;
+    }
+
+    FILE *fp;
+
+    ASSERT_TRUE(NULL != (fp = popen(
+      "logcat -v long -v America/Los_Angeles -b all -t 3 2>/dev/null",
+      "r")));
+
+    char buffer[5120];
+
+    int count = 0;
+
+    while (fgetLongTime(buffer, sizeof(buffer), fp)) {
+        if (strstr(buffer, " -0700") || strstr(buffer, " -0800")) {
+            ++count;
+        }
+    }
+
+    pclose(fp);
+
+    ASSERT_EQ(3, count);
+}
+
+TEST(logcat, ntz) {
+    FILE *fp;
+
+    ASSERT_TRUE(NULL != (fp = popen(
+      "logcat -v long -v America/Los_Angeles -v zone -b all -t 3 2>/dev/null",
+      "r")));
+
+    char buffer[5120];
+
+    int count = 0;
+
+    while (fgetLongTime(buffer, sizeof(buffer), fp)) {
+        if (strstr(buffer, " -0700") || strstr(buffer, " -0800")) {
+            ++count;
+        }
+    }
+
+    pclose(fp);
+
+    ASSERT_EQ(0, count);
+}
+
 TEST(logcat, tail_3) {
     FILE *fp;
 
@@ -85,12 +207,8 @@ TEST(logcat, tail_3) {
 
     int count = 0;
 
-    while (fgets(buffer, sizeof(buffer), fp)) {
-        if ((buffer[0] == '[') && (buffer[1] == ' ')
-         && isdigit(buffer[2]) && isdigit(buffer[3])
-         && (buffer[4] == '-')) {
-            ++count;
-        }
+    while (fgetLongTime(buffer, sizeof(buffer), fp)) {
+        ++count;
     }
 
     pclose(fp);
@@ -109,12 +227,8 @@ TEST(logcat, tail_10) {
 
     int count = 0;
 
-    while (fgets(buffer, sizeof(buffer), fp)) {
-        if ((buffer[0] == '[') && (buffer[1] == ' ')
-         && isdigit(buffer[2]) && isdigit(buffer[3])
-         && (buffer[4] == '-')) {
-            ++count;
-        }
+    while (fgetLongTime(buffer, sizeof(buffer), fp)) {
+        ++count;
     }
 
     pclose(fp);
@@ -133,12 +247,8 @@ TEST(logcat, tail_100) {
 
     int count = 0;
 
-    while (fgets(buffer, sizeof(buffer), fp)) {
-        if ((buffer[0] == '[') && (buffer[1] == ' ')
-         && isdigit(buffer[2]) && isdigit(buffer[3])
-         && (buffer[4] == '-')) {
-            ++count;
-        }
+    while (fgetLongTime(buffer, sizeof(buffer), fp)) {
+        ++count;
     }
 
     pclose(fp);
@@ -157,12 +267,8 @@ TEST(logcat, tail_1000) {
 
     int count = 0;
 
-    while (fgets(buffer, sizeof(buffer), fp)) {
-        if ((buffer[0] == '[') && (buffer[1] == ' ')
-         && isdigit(buffer[2]) && isdigit(buffer[3])
-         && (buffer[4] == '-')) {
-            ++count;
-        }
+    while (fgetLongTime(buffer, sizeof(buffer), fp)) {
+        ++count;
     }
 
     pclose(fp);
@@ -179,21 +285,15 @@ TEST(logcat, tail_time) {
     char *last_timestamp = NULL;
     char *first_timestamp = NULL;
     int count = 0;
-    const unsigned int time_length = 18;
-    const unsigned int time_offset = 2;
 
-    while (fgets(buffer, sizeof(buffer), fp)) {
-        if ((buffer[0] == '[') && (buffer[1] == ' ')
-         && isdigit(buffer[time_offset]) && isdigit(buffer[time_offset + 1])
-         && (buffer[time_offset + 2] == '-')) {
-            ++count;
-            buffer[time_length + time_offset] = '\0';
-            if (!first_timestamp) {
-                first_timestamp = strdup(buffer + time_offset);
-            }
-            free(last_timestamp);
-            last_timestamp = strdup(buffer + time_offset);
+    char *cp;
+    while ((cp = fgetLongTime(buffer, sizeof(buffer), fp))) {
+        ++count;
+        if (!first_timestamp) {
+            first_timestamp = strdup(cp);
         }
+        free(last_timestamp);
+        last_timestamp = strdup(cp);
     }
     pclose(fp);
 
@@ -208,28 +308,24 @@ TEST(logcat, tail_time) {
     int second_count = 0;
     int last_timestamp_count = -1;
 
-    while (fgets(buffer, sizeof(buffer), fp)) {
-        if ((buffer[0] == '[') && (buffer[1] == ' ')
-         && isdigit(buffer[time_offset]) && isdigit(buffer[time_offset + 1])
-         && (buffer[time_offset + 2] == '-')) {
-            ++second_count;
-            buffer[time_length + time_offset] = '\0';
-            if (first_timestamp) {
-                // we can get a transitory *extremely* rare failure if hidden
-                // underneath the time is *exactly* XX-XX XX:XX:XX.XXX000000
-                EXPECT_STREQ(buffer + time_offset, first_timestamp);
-                free(first_timestamp);
-                first_timestamp = NULL;
-            }
-            if (!strcmp(buffer + time_offset, last_timestamp)) {
-                last_timestamp_count = second_count;
-            }
+    while ((cp = fgetLongTime(buffer, sizeof(buffer), fp))) {
+        ++second_count;
+        if (first_timestamp) {
+            // we can get a transitory *extremely* rare failure if hidden
+            // underneath the time is *exactly* XX-XX XX:XX:XX.XXX000000
+            EXPECT_STREQ(cp, first_timestamp);
+            free(first_timestamp);
+            first_timestamp = NULL;
+        }
+        if (!strcmp(cp, last_timestamp)) {
+            last_timestamp_count = second_count;
         }
     }
     pclose(fp);
 
     free(last_timestamp);
     last_timestamp = NULL;
+    free(first_timestamp);
 
     EXPECT_TRUE(first_timestamp == NULL);
     EXPECT_LE(count, second_count);
@@ -510,13 +606,16 @@ TEST(logcat, logrotate) {
                 char c;
 
                 if ((2 == sscanf(buffer, "%d log.tx%c", &num, &c)) &&
-                        (num <= 24)) {
+                        (num <= 40)) {
                     ++count;
                 } else if (strncmp(buffer, total, sizeof(total) - 1)) {
                     fprintf(stderr, "WARNING: Parse error: %s", buffer);
                 }
             }
             pclose(fp);
+            if ((count != 7) && (count != 8)) {
+                fprintf(stderr, "count=%d\n", count);
+            }
             EXPECT_TRUE(count == 7 || count == 8);
         }
     }
@@ -636,8 +735,8 @@ TEST(logcat, logrotate_continue) {
         EXPECT_FALSE(system(command));
         return;
     }
-    DIR *dir;
-    EXPECT_TRUE(NULL != (dir = opendir(tmp_out_dir)));
+    std::unique_ptr<DIR, decltype(&closedir)> dir(opendir(tmp_out_dir), closedir);
+    EXPECT_NE(nullptr, dir);
     if (!dir) {
         snprintf(command, sizeof(command), cleanup_cmd, tmp_out_dir);
         EXPECT_FALSE(system(command));
@@ -645,7 +744,7 @@ TEST(logcat, logrotate_continue) {
     }
     struct dirent *entry;
     unsigned count = 0;
-    while ((entry = readdir(dir))) {
+    while ((entry = readdir(dir.get()))) {
         if (strncmp(entry->d_name, log_filename, sizeof(log_filename) - 1)) {
             continue;
         }
@@ -668,7 +767,6 @@ TEST(logcat, logrotate_continue) {
         free(line);
         unlink(command);
     }
-    closedir(dir);
     if (count > 1) {
         char *brk = strpbrk(second_last_line, "\r\n");
         if (!brk) {

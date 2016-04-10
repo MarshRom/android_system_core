@@ -14,31 +14,33 @@
  * limitations under the License.
  */
 
-#define LOG_TAG "DEBUG"
-
-#include <stdio.h>
-#include <errno.h>
-#include <signal.h>
-#include <pthread.h>
-#include <stdarg.h>
-#include <fcntl.h>
-#include <sys/types.h>
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <sys/types.h>
 #include <time.h>
 
-#include <sys/ptrace.h>
-#include <sys/wait.h>
 #include <elf.h>
-#include <sys/stat.h>
 #include <sys/poll.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+
+#include <set>
 
 #include <selinux/android.h>
 
 #include <log/logger.h>
 
-#include <cutils/sockets.h>
-#include <cutils/properties.h>
 #include <cutils/debugger.h>
+#include <cutils/properties.h>
+#include <cutils/sockets.h>
+#include <nativehelper/ScopedFd.h>
 
 #include <linux/input.h>
 
@@ -65,46 +67,27 @@ struct debugger_request_t {
   int32_t original_si_code;
 };
 
-static void wait_for_user_action(const debugger_request_t &request) {
-  // Find out the name of the process that crashed.
-  char path[64];
-  snprintf(path, sizeof(path), "/proc/%d/exe", request.pid);
-
-  char exe[PATH_MAX];
-  int count;
-  if ((count = readlink(path, exe, sizeof(exe) - 1)) == -1) {
-    ALOGE("readlink('%s') failed: %s", path, strerror(errno));
-    strlcpy(exe, "unknown", sizeof(exe));
-  } else {
-    exe[count] = '\0';
-  }
-
+static void wait_for_user_action(const debugger_request_t& request) {
   // Explain how to attach the debugger.
-  ALOGI("********************************************************\n"
+  ALOGI("***********************************************************\n"
         "* Process %d has been suspended while crashing.\n"
-        "* To attach gdbserver for a gdb connection on port 5039\n"
-        "* and start gdbclient:\n"
+        "* To attach gdbserver and start gdb, run this on the host:\n"
         "*\n"
-        "*     gdbclient %s :5039 %d\n"
-        "* or\n"
-        "*     dddclient %s :5039 %d\n"
+        "*     gdbclient.py -p %d\n"
         "*\n"
         "* Wait for gdb to start, then press the VOLUME DOWN key\n"
         "* to let the process continue crashing.\n"
-        "********************************************************",
-        request.pid, exe, request.tid, exe, request.tid);
+        "***********************************************************",
+        request.pid, request.tid);
 
   // Wait for VOLUME DOWN.
-  if (init_getevent() == 0) {
-    while (true) {
-      input_event e;
-      if (get_event(&e, -1) == 0) {
-        if (e.type == EV_KEY && e.code == KEY_VOLUMEDOWN && e.value == 0) {
-          break;
-        }
+  while (true) {
+    input_event e;
+    if (get_event(&e, -1) == 0) {
+      if (e.type == EV_KEY && e.code == KEY_VOLUMEDOWN && e.value == 0) {
+        break;
       }
     }
-    uninit_getevent();
   }
 
   ALOGI("debuggerd resuming process %d", request.pid);
@@ -138,8 +121,6 @@ static int get_process_info(pid_t tid, pid_t* out_pid, uid_t* out_uid, uid_t* ou
   return fields == 7 ? 0 : -1;
 }
 
-static int selinux_enabled;
-
 /*
  * Corresponds with debugger_action_t enum type in
  * include/cutils/debugger.h.
@@ -150,34 +131,44 @@ static const char *debuggerd_perms[] = {
   "dump_backtrace"
 };
 
-static bool selinux_action_allowed(int s, pid_t tid, debugger_action_t action)
+static int audit_callback(void* data, security_class_t /* cls */, char* buf, size_t len)
+{
+    struct debugger_request_t* req = reinterpret_cast<debugger_request_t*>(data);
+
+    if (!req) {
+        ALOGE("No debuggerd request audit data");
+        return 0;
+    }
+
+    snprintf(buf, len, "pid=%d uid=%d gid=%d", req->pid, req->uid, req->gid);
+    return 0;
+}
+
+static bool selinux_action_allowed(int s, debugger_request_t* request)
 {
   char *scon = NULL, *tcon = NULL;
   const char *tclass = "debuggerd";
   const char *perm;
   bool allowed = false;
 
-  if (selinux_enabled <= 0)
-    return true;
-
-  if (action <= 0 || action >= (sizeof(debuggerd_perms)/sizeof(debuggerd_perms[0]))) {
-    ALOGE("SELinux:  No permission defined for debugger action %d", action);
+  if (request->action <= 0 || request->action >= (sizeof(debuggerd_perms)/sizeof(debuggerd_perms[0]))) {
+    ALOGE("SELinux:  No permission defined for debugger action %d", request->action);
     return false;
   }
 
-  perm = debuggerd_perms[action];
+  perm = debuggerd_perms[request->action];
 
   if (getpeercon(s, &scon) < 0) {
     ALOGE("Cannot get peer context from socket\n");
     goto out;
   }
 
-  if (getpidcon(tid, &tcon) < 0) {
-    ALOGE("Cannot get context for tid %d\n", tid);
+  if (getpidcon(request->tid, &tcon) < 0) {
+    ALOGE("Cannot get context for tid %d\n", request->tid);
     goto out;
   }
 
-  allowed = (selinux_check_access(scon, tcon, tclass, perm, NULL) == 0);
+  allowed = (selinux_check_access(scon, tcon, tclass, perm, reinterpret_cast<void*>(request)) == 0);
 
 out:
    freecon(scon);
@@ -248,7 +239,7 @@ static int read_request(int fd, debugger_request_t* out_request) {
       return -1;
     }
 
-    if (!selinux_action_allowed(fd, out_request->tid, out_request->action))
+    if (!selinux_action_allowed(fd, out_request))
       return -1;
   } else {
     // No one else is allowed to dump arbitrary processes.
@@ -358,165 +349,332 @@ static void redirect_to_32(int fd, debugger_request_t* request) {
 }
 #endif
 
+static void ptrace_siblings(pid_t pid, pid_t main_tid, std::set<pid_t>& tids) {
+  char task_path[64];
+
+  snprintf(task_path, sizeof(task_path), "/proc/%d/task", pid);
+
+  std::unique_ptr<DIR, int (*)(DIR*)> d(opendir(task_path), closedir);
+
+  // Bail early if the task directory cannot be opened.
+  if (!d) {
+    ALOGE("debuggerd: failed to open /proc/%d/task: %s", pid, strerror(errno));
+    return;
+  }
+
+  struct dirent* de;
+  while ((de = readdir(d.get())) != NULL) {
+    // Ignore "." and "..".
+    if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) {
+      continue;
+    }
+
+    char* end;
+    pid_t tid = strtoul(de->d_name, &end, 10);
+    if (*end) {
+      continue;
+    }
+
+    if (tid == main_tid) {
+      continue;
+    }
+
+    if (ptrace(PTRACE_ATTACH, tid, 0, 0) < 0) {
+      ALOGE("debuggerd: ptrace attach to %d failed: %s", tid, strerror(errno));
+      continue;
+    }
+
+    tids.insert(tid);
+  }
+}
+
+static bool perform_dump(const debugger_request_t& request, int fd, int tombstone_fd,
+                         BacktraceMap* backtrace_map, const std::set<pid_t>& siblings) {
+  if (TEMP_FAILURE_RETRY(write(fd, "\0", 1)) != 1) {
+    ALOGE("debuggerd: failed to respond to client: %s\n", strerror(errno));
+    return false;
+  }
+
+  int total_sleep_time_usec = 0;
+  while (true) {
+    int signal = wait_for_signal(request.tid, &total_sleep_time_usec);
+    switch (signal) {
+      case -1:
+        ALOGE("debuggerd: timed out waiting for signal");
+        return false;
+
+      case SIGSTOP:
+        if (request.action == DEBUGGER_ACTION_DUMP_TOMBSTONE) {
+          ALOGV("debuggerd: stopped -- dumping to tombstone");
+          engrave_tombstone(tombstone_fd, backtrace_map, request.pid, request.tid, siblings, signal,
+                            request.original_si_code, request.abort_msg_address);
+        } else if (request.action == DEBUGGER_ACTION_DUMP_BACKTRACE) {
+          ALOGV("debuggerd: stopped -- dumping to fd");
+          dump_backtrace(fd, -1, backtrace_map, request.pid, request.tid, siblings);
+        } else {
+          ALOGV("debuggerd: stopped -- continuing");
+          if (ptrace(PTRACE_CONT, request.tid, 0, 0) != 0) {
+            ALOGE("debuggerd: ptrace continue failed: %s", strerror(errno));
+            return false;
+          }
+          continue;  // loop again
+        }
+        break;
+
+      case SIGABRT:
+      case SIGBUS:
+      case SIGFPE:
+      case SIGILL:
+      case SIGSEGV:
+#ifdef SIGSTKFLT
+      case SIGSTKFLT:
+#endif
+      case SIGTRAP:
+        ALOGV("stopped -- fatal signal\n");
+        // Send a SIGSTOP to the process to make all of
+        // the non-signaled threads stop moving.  Without
+        // this we get a lot of "ptrace detach failed:
+        // No such process".
+        kill(request.pid, SIGSTOP);
+        engrave_tombstone(tombstone_fd, backtrace_map, request.pid, request.tid, siblings, signal,
+                          request.original_si_code, request.abort_msg_address);
+        break;
+
+      default:
+        ALOGE("debuggerd: process stopped due to unexpected signal %d\n", signal);
+        break;
+    }
+    break;
+  }
+
+  return true;
+}
+
+static bool drop_privileges() {
+  if (setresgid(AID_DEBUGGERD, AID_DEBUGGERD, AID_DEBUGGERD) != 0) {
+    ALOGE("debuggerd: failed to setresgid");
+    return false;
+  }
+
+  if (setresuid(AID_DEBUGGERD, AID_DEBUGGERD, AID_DEBUGGERD) != 0) {
+    ALOGE("debuggerd: failed to setresuid");
+    return false;
+  }
+
+  return true;
+}
+
+static bool fork_signal_sender(int* in_fd, int* out_fd, pid_t* sender_pid, pid_t target_pid) {
+  int input_pipe[2];
+  int output_pipe[2];
+  if (pipe(input_pipe) != 0) {
+    ALOGE("debuggerd: failed to create input pipe for signal sender: %s", strerror(errno));
+    return false;
+  }
+
+  if (pipe(output_pipe) != 0) {
+    close(input_pipe[0]);
+    close(input_pipe[1]);
+    ALOGE("debuggerd: failed to create output pipe for signal sender: %s", strerror(errno));
+    return false;
+  }
+
+  pid_t fork_pid = fork();
+  if (fork_pid == -1) {
+    ALOGE("debuggerd: failed to initialize signal sender: fork failed: %s", strerror(errno));
+    return false;
+  } else if (fork_pid == 0) {
+    close(input_pipe[1]);
+    close(output_pipe[0]);
+    auto wait = [=]() {
+      char buf[1];
+      if (TEMP_FAILURE_RETRY(read(input_pipe[0], buf, 1)) != 1) {
+        ALOGE("debuggerd: signal sender failed to read from pipe");
+        exit(1);
+      }
+    };
+    auto notify_done = [=]() {
+      if (TEMP_FAILURE_RETRY(write(output_pipe[1], "", 1)) != 1) {
+        ALOGE("debuggerd: signal sender failed to write to pipe");
+        exit(1);
+      }
+    };
+
+    wait();
+    if (kill(target_pid, SIGSTOP) != 0) {
+      ALOGE("debuggerd: failed to stop target '%d': %s", target_pid, strerror(errno));
+    }
+    notify_done();
+
+    wait();
+    if (kill(target_pid, SIGCONT) != 0) {
+      ALOGE("debuggerd: failed to resume target '%d': %s", target_pid, strerror(errno));
+    }
+    notify_done();
+
+    exit(0);
+  } else {
+    close(input_pipe[0]);
+    close(output_pipe[1]);
+    *in_fd = input_pipe[1];
+    *out_fd = output_pipe[0];
+    *sender_pid = fork_pid;
+    return true;
+  }
+}
+
 static void handle_request(int fd) {
   ALOGV("handle_request(%d)\n", fd);
 
+  ScopedFd closer(fd);
   debugger_request_t request;
   memset(&request, 0, sizeof(request));
   int status = read_request(fd, &request);
-  if (!status) {
-    ALOGV("BOOM: pid=%d uid=%d gid=%d tid=%d\n",
-         request.pid, request.uid, request.gid, request.tid);
+  if (status != 0) {
+    return;
+  }
+
+  ALOGV("BOOM: pid=%d uid=%d gid=%d tid=%d\n", request.pid, request.uid, request.gid, request.tid);
 
 #if defined(__LP64__)
-    // On 64 bit systems, requests to dump 32 bit and 64 bit tids come
-    // to the 64 bit debuggerd. If the process is a 32 bit executable,
-    // redirect the request to the 32 bit debuggerd.
-    if (is32bit(request.tid)) {
-      // Only dump backtrace and dump tombstone requests can be redirected.
-      if (request.action == DEBUGGER_ACTION_DUMP_BACKTRACE
-          || request.action == DEBUGGER_ACTION_DUMP_TOMBSTONE) {
-        redirect_to_32(fd, &request);
-      } else {
-        ALOGE("debuggerd: Not allowed to redirect action %d to 32 bit debuggerd\n",
-              request.action);
-      }
-      close(fd);
-      return;
-    }
-#endif
-
-    // At this point, the thread that made the request is blocked in
-    // a read() call.  If the thread has crashed, then this gives us
-    // time to PTRACE_ATTACH to it before it has a chance to really fault.
-    //
-    // The PTRACE_ATTACH sends a SIGSTOP to the target process, but it
-    // won't necessarily have stopped by the time ptrace() returns.  (We
-    // currently assume it does.)  We write to the file descriptor to
-    // ensure that it can run as soon as we call PTRACE_CONT below.
-    // See details in bionic/libc/linker/debugger.c, in function
-    // debugger_signal_handler().
-    if (ptrace(PTRACE_ATTACH, request.tid, 0, 0)) {
-      ALOGE("ptrace attach failed: %s\n", strerror(errno));
+  // On 64 bit systems, requests to dump 32 bit and 64 bit tids come
+  // to the 64 bit debuggerd. If the process is a 32 bit executable,
+  // redirect the request to the 32 bit debuggerd.
+  if (is32bit(request.tid)) {
+    // Only dump backtrace and dump tombstone requests can be redirected.
+    if (request.action == DEBUGGER_ACTION_DUMP_BACKTRACE ||
+        request.action == DEBUGGER_ACTION_DUMP_TOMBSTONE) {
+      redirect_to_32(fd, &request);
     } else {
-      bool detach_failed = false;
-      bool tid_unresponsive = false;
-      bool attach_gdb = should_attach_gdb(&request);
-      if (TEMP_FAILURE_RETRY(write(fd, "\0", 1)) != 1) {
-        ALOGE("failed responding to client: %s\n", strerror(errno));
-      } else {
-        char* tombstone_path = NULL;
-
-        if (request.action == DEBUGGER_ACTION_CRASH) {
-          close(fd);
-          fd = -1;
-        }
-
-        int total_sleep_time_usec = 0;
-        for (;;) {
-          int signal = wait_for_sigstop(request.tid, &total_sleep_time_usec, &detach_failed);
-          if (signal == -1) {
-            tid_unresponsive = true;
-            break;
-          }
-
-          switch (signal) {
-            case SIGSTOP:
-              if (request.action == DEBUGGER_ACTION_DUMP_TOMBSTONE) {
-                ALOGV("stopped -- dumping to tombstone\n");
-                tombstone_path = engrave_tombstone(request.pid, request.tid,
-                                                   signal, request.original_si_code,
-                                                   request.abort_msg_address, true,
-                                                   &detach_failed, &total_sleep_time_usec);
-              } else if (request.action == DEBUGGER_ACTION_DUMP_BACKTRACE) {
-                ALOGV("stopped -- dumping to fd\n");
-                dump_backtrace(fd, -1, request.pid, request.tid, &detach_failed,
-                               &total_sleep_time_usec);
-              } else {
-                ALOGV("stopped -- continuing\n");
-                status = ptrace(PTRACE_CONT, request.tid, 0, 0);
-                if (status) {
-                  ALOGE("ptrace continue failed: %s\n", strerror(errno));
-                }
-                continue; // loop again
-              }
-              break;
-
-            case SIGABRT:
-            case SIGBUS:
-            case SIGFPE:
-            case SIGILL:
-            case SIGPIPE:
-            case SIGSEGV:
-#ifdef SIGSTKFLT
-            case SIGSTKFLT:
+      ALOGE("debuggerd: Not allowed to redirect action %d to 32 bit debuggerd\n", request.action);
+    }
+    return;
+  }
 #endif
-            case SIGTRAP:
-              ALOGV("stopped -- fatal signal\n");
-              // Send a SIGSTOP to the process to make all of
-              // the non-signaled threads stop moving.  Without
-              // this we get a lot of "ptrace detach failed:
-              // No such process".
-              kill(request.pid, SIGSTOP);
-              // don't dump sibling threads when attaching to GDB because it
-              // makes the process less reliable, apparently...
-              tombstone_path = engrave_tombstone(request.pid, request.tid,
-                                                 signal, request.original_si_code,
-                                                 request.abort_msg_address, !attach_gdb,
-                                                 &detach_failed, &total_sleep_time_usec);
-              break;
 
-            default:
-              ALOGE("process stopped due to unexpected signal %d\n", signal);
-              break;
-          }
-          break;
-        }
+  // Fork a child to handle the rest of the request.
+  pid_t fork_pid = fork();
+  if (fork_pid == -1) {
+    ALOGE("debuggerd: failed to fork: %s\n", strerror(errno));
+    return;
+  } else if (fork_pid != 0) {
+    waitpid(fork_pid, nullptr, 0);
+    return;
+  }
 
-        if (request.action == DEBUGGER_ACTION_DUMP_TOMBSTONE) {
-          if (tombstone_path) {
-            write(fd, tombstone_path, strlen(tombstone_path));
-          }
-          close(fd);
-          fd = -1;
-        }
-        free(tombstone_path);
+  // Open the tombstone file if we need it.
+  std::string tombstone_path;
+  int tombstone_fd = -1;
+  switch (request.action) {
+    case DEBUGGER_ACTION_DUMP_TOMBSTONE:
+    case DEBUGGER_ACTION_CRASH:
+      tombstone_fd = open_tombstone(&tombstone_path);
+      if (tombstone_fd == -1) {
+        ALOGE("debuggerd: failed to open tombstone file: %s\n", strerror(errno));
+        exit(1);
       }
+      break;
 
-      if (!tid_unresponsive) {
-        ALOGV("detaching");
-        if (attach_gdb) {
-          // stop the process so we can debug
-          kill(request.pid, SIGSTOP);
+    case DEBUGGER_ACTION_DUMP_BACKTRACE:
+      break;
+
+    default:
+      ALOGE("debuggerd: unexpected request action: %d", request.action);
+      exit(1);
+  }
+
+  // At this point, the thread that made the request is blocked in
+  // a read() call.  If the thread has crashed, then this gives us
+  // time to PTRACE_ATTACH to it before it has a chance to really fault.
+  //
+  // The PTRACE_ATTACH sends a SIGSTOP to the target process, but it
+  // won't necessarily have stopped by the time ptrace() returns.  (We
+  // currently assume it does.)  We write to the file descriptor to
+  // ensure that it can run as soon as we call PTRACE_CONT below.
+  // See details in bionic/libc/linker/debugger.c, in function
+  // debugger_signal_handler().
+
+  // Attach to the target process.
+  if (ptrace(PTRACE_ATTACH, request.tid, 0, 0) != 0) {
+    ALOGE("debuggerd: ptrace attach failed: %s", strerror(errno));
+    exit(1);
+  }
+
+  // Don't attach to the sibling threads if we want to attach gdb.
+  // Supposedly, it makes the process less reliable.
+  bool attach_gdb = should_attach_gdb(&request);
+  int signal_in_fd = -1;
+  int signal_out_fd = -1;
+  pid_t signal_pid = 0;
+  if (attach_gdb) {
+    // Open all of the input devices we need to listen for VOLUMEDOWN before dropping privileges.
+    if (init_getevent() != 0) {
+      ALOGE("debuggerd: failed to initialize input device, not waiting for gdb");
+      attach_gdb = false;
+    }
+
+    // Fork a process that stays root, and listens on a pipe to pause and resume the target.
+    if (!fork_signal_sender(&signal_in_fd, &signal_out_fd, &signal_pid, request.pid)) {
+      attach_gdb = false;
+    }
+  }
+
+  auto notify_signal_sender = [=]() {
+    char buf[1];
+    if (TEMP_FAILURE_RETRY(write(signal_in_fd, "", 1)) != 1) {
+      ALOGE("debuggerd: failed to notify signal process: %s", strerror(errno));
+    } else if (TEMP_FAILURE_RETRY(read(signal_out_fd, buf, 1)) != 1) {
+      ALOGE("debuggerd: failed to read response from signal process: %s", strerror(errno));
+    }
+  };
+
+  std::set<pid_t> siblings;
+  if (!attach_gdb) {
+    ptrace_siblings(request.pid, request.tid, siblings);
+  }
+
+  // Generate the backtrace map before dropping privileges.
+  std::unique_ptr<BacktraceMap> backtrace_map(BacktraceMap::Create(request.pid));
+
+  bool succeeded = false;
+
+  // Now that we've done everything that requires privileges, we can drop them.
+  if (drop_privileges()) {
+    succeeded = perform_dump(request, fd, tombstone_fd, backtrace_map.get(), siblings);
+    if (succeeded) {
+      if (request.action == DEBUGGER_ACTION_DUMP_TOMBSTONE) {
+        if (!tombstone_path.empty()) {
+          write(fd, tombstone_path.c_str(), tombstone_path.length());
         }
-        if (ptrace(PTRACE_DETACH, request.tid, 0, 0)) {
-          ALOGE("ptrace detach from %d failed: %s", request.tid, strerror(errno));
-          detach_failed = true;
-        } else if (attach_gdb) {
-          // if debug.db.uid is set, its value indicates if we should wait
-          // for user action for the crashing process.
-          // in this case, we log a message and turn the debug LED on
-          // waiting for a gdb connection (for instance)
-          wait_for_user_action(request);
-        }
-      }
-
-      // resume stopped process (so it can crash in peace).
-      kill(request.pid, SIGCONT);
-
-      // If we didn't successfully detach, we're still the parent, and the
-      // actual parent won't receive a death notification via wait(2).  At this point
-      // there's not much we can do about that.
-      if (detach_failed) {
-        ALOGE("debuggerd committing suicide to free the zombie!\n");
-        kill(getpid(), SIGKILL);
       }
     }
 
+    if (attach_gdb) {
+      // Tell the signal process to send SIGSTOP to the target.
+      notify_signal_sender();
+    }
   }
-  if (fd >= 0) {
-    close(fd);
+
+  if (ptrace(PTRACE_DETACH, request.tid, 0, 0) != 0) {
+    ALOGE("debuggerd: ptrace detach from %d failed: %s", request.tid, strerror(errno));
   }
+
+  for (pid_t sibling : siblings) {
+    ptrace(PTRACE_DETACH, sibling, 0, 0);
+  }
+
+  // Wait for gdb, if requested.
+  if (attach_gdb && succeeded) {
+    wait_for_user_action(request);
+
+    // Tell the signal process to send SIGCONT to the target.
+    notify_signal_sender();
+
+    uninit_getevent();
+    waitpid(signal_pid, nullptr, 0);
+  }
+
+  exit(!succeeded);
 }
 
 static int do_server() {
@@ -535,13 +693,6 @@ static int do_server() {
   // Ignore failed writes to closed sockets
   signal(SIGPIPE, SIG_IGN);
 
-  int logsocket = socket_local_client("logd", ANDROID_SOCKET_NAMESPACE_ABSTRACT, SOCK_DGRAM);
-  if (logsocket < 0) {
-    logsocket = -1;
-  } else {
-    fcntl(logsocket, F_SETFD, FD_CLOEXEC);
-  }
-
   struct sigaction act;
   act.sa_handler = SIG_DFL;
   sigemptyset(&act.sa_mask);
@@ -549,25 +700,23 @@ static int do_server() {
   act.sa_flags = SA_NOCLDWAIT;
   sigaction(SIGCHLD, &act, 0);
 
-  int s = socket_local_server(SOCKET_NAME, ANDROID_SOCKET_NAMESPACE_ABSTRACT, SOCK_STREAM);
-  if (s < 0)
-    return 1;
-  fcntl(s, F_SETFD, FD_CLOEXEC);
+  int s = socket_local_server(SOCKET_NAME, ANDROID_SOCKET_NAMESPACE_ABSTRACT,
+                              SOCK_STREAM | SOCK_CLOEXEC);
+  if (s == -1) return 1;
 
   ALOGI("debuggerd: starting\n");
 
   for (;;) {
-    sockaddr addr;
-    socklen_t alen = sizeof(addr);
+    sockaddr_storage ss;
+    sockaddr* addrp = reinterpret_cast<sockaddr*>(&ss);
+    socklen_t alen = sizeof(ss);
 
     ALOGV("waiting for connection\n");
-    int fd = accept(s, &addr, &alen);
-    if (fd < 0) {
-      ALOGV("accept failed: %s\n", strerror(errno));
+    int fd = accept4(s, addrp, &alen, SOCK_CLOEXEC);
+    if (fd == -1) {
+      ALOGE("accept failed: %s\n", strerror(errno));
       continue;
     }
-
-    fcntl(fd, F_SETFD, FD_CLOEXEC);
 
     handle_request(fd);
   }
@@ -605,7 +754,8 @@ static void usage() {
 int main(int argc, char** argv) {
   union selinux_callback cb;
   if (argc == 1) {
-    selinux_enabled = is_selinux_enabled();
+    cb.func_audit = audit_callback;
+    selinux_set_callback(SELINUX_CB_AUDIT, cb);
     cb.func_log = selinux_log_callback;
     selinux_set_callback(SELINUX_CB_LOG, cb);
     return do_server();

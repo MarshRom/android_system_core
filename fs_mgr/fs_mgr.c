@@ -100,7 +100,7 @@ static void check_fs(char *blk_device, char *fs_type, char *target)
     int status;
     int ret;
     long tmpmnt_flags = MS_NOATIME | MS_NOEXEC | MS_NOSUID;
-    char *tmpmnt_opts = "nomblk_io_submit,errors=remount-ro";
+    char tmpmnt_opts[64] = "errors=remount-ro";
     char *e2fsck_argv[] = {
         E2FSCK_BIN,
         "-y",
@@ -123,6 +123,10 @@ static void check_fs(char *blk_device, char *fs_type, char *target)
          * fix the filesystem.
          */
         errno = 0;
+        if (!strcmp(fs_type, "ext4")) {
+            // This option is only valid with ext4
+            strlcat(tmpmnt_opts, ",nomblk_io_submit", sizeof(tmpmnt_opts));
+        }
         ret = mount(blk_device, target, fs_type, tmpmnt_flags, tmpmnt_opts);
         INFO("%s(): mount(%s,%s,%s)=%d: %s\n",
              __func__, blk_device, target, fs_type, ret, strerror(errno));
@@ -152,8 +156,8 @@ static void check_fs(char *blk_device, char *fs_type, char *target)
             INFO("Running %s on %s\n", E2FSCK_BIN, blk_device);
 
             ret = android_fork_execvp_ext(ARRAY_SIZE(e2fsck_argv), e2fsck_argv,
-                                        &status, true, LOG_KLOG | LOG_FILE,
-                                        true, FSCK_LOG_FILE);
+                                          &status, true, LOG_KLOG | LOG_FILE,
+                                          true, FSCK_LOG_FILE, NULL, 0);
 
             if (ret < 0) {
                 /* No need to check for error in fork, we can't really handle it now */
@@ -161,16 +165,16 @@ static void check_fs(char *blk_device, char *fs_type, char *target)
             }
         }
     } else if (!strcmp(fs_type, "f2fs")) {
-        char *f2fs_fsck_argv[] = {
-            F2FS_FSCK_BIN,
-            "-a",
-            blk_device
-        };
-        INFO("Running %s on %s\n", F2FS_FSCK_BIN, blk_device);
+            char *f2fs_fsck_argv[] = {
+                    F2FS_FSCK_BIN,
+                    "-a",
+                    blk_device
+            };
+        INFO("Running %s -a %s\n", F2FS_FSCK_BIN, blk_device);
 
         ret = android_fork_execvp_ext(ARRAY_SIZE(f2fs_fsck_argv), f2fs_fsck_argv,
                                       &status, true, LOG_KLOG | LOG_FILE,
-                                      true, FSCK_LOG_FILE);
+                                      true, FSCK_LOG_FILE, NULL, 0);
         if (ret < 0) {
             /* No need to check for error in fork, we can't really handle it now */
             ERROR("Failed trying to run %s\n", F2FS_FSCK_BIN);
@@ -581,6 +585,14 @@ int fs_mgr_mount_all(struct fstab *fstab)
             continue;
         }
 
+        /* Skip mounting the root partition, as it will already have been mounted */
+        if (!strcmp(fstab->recs[i].mount_point, "/")) {
+            if ((fstab->recs[i].fs_mgr_flags & MS_RDONLY) != 0) {
+                fs_mgr_set_blk_ro(fstab->recs[i].blk_device);
+            }
+            continue;
+        }
+
         /* Translate LABEL= file system labels into block devices */
         if (!strcmp(fstab->recs[i].fs_type, "ext2") ||
             !strcmp(fstab->recs[i].fs_type, "ext3") ||
@@ -897,7 +909,8 @@ int fs_mgr_swapon_all(struct fstab *fstab)
         /* Initialize the swap area */
         mkswap_argv[1] = fstab->recs[i].blk_device;
         err = android_fork_execvp_ext(ARRAY_SIZE(mkswap_argv), mkswap_argv,
-                                      &status, true, LOG_KLOG, false, NULL);
+                                      &status, true, LOG_KLOG, false, NULL,
+                                      NULL, 0);
         if (err) {
             ERROR("mkswap failed for %s\n", fstab->recs[i].blk_device);
             ret = -1;

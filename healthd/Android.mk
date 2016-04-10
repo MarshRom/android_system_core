@@ -6,6 +6,16 @@ include $(CLEAR_VARS)
 LOCAL_SRC_FILES := healthd_board_default.cpp healthd_msm_alarm.cpp
 LOCAL_MODULE := libhealthd.default
 LOCAL_CFLAGS := -Werror
+LOCAL_C_INCLUDES := $(LOCAL_PATH)/include
+LOCAL_EXPORT_C_INCLUDE_DIRS := $(LOCAL_PATH)/include
+include $(BUILD_STATIC_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_SRC_FILES := BatteryMonitor.cpp
+LOCAL_MODULE := libbatterymonitor
+LOCAL_C_INCLUDES := $(LOCAL_PATH)/include
+LOCAL_EXPORT_C_INCLUDE_DIRS := $(LOCAL_PATH)/include
+LOCAL_STATIC_LIBRARIES := libutils
 include $(BUILD_STATIC_LIBRARY)
 
 include $(CLEAR_VARS)
@@ -16,12 +26,21 @@ include $(BUILD_STATIC_LIBRARY)
 
 include $(CLEAR_VARS)
 
+ifeq ($(strip $(BOARD_CHARGER_NO_UI)),true)
+LOCAL_CHARGER_NO_UI := true
+endif
+ifdef BRILLO
+LOCAL_CHARGER_NO_UI := true
+endif
+
 LOCAL_SRC_FILES := \
 	healthd.cpp \
 	healthd_mode_android.cpp \
-	healthd_mode_charger.cpp \
-	BatteryMonitor.cpp \
 	BatteryPropertiesRegistrar.cpp
+
+ifneq ($(strip $(LOCAL_CHARGER_NO_UI)),true)
+LOCAL_SRC_FILES += healthd_mode_charger.cpp
+endif
 
 LOCAL_MODULE := healthd
 LOCAL_MODULE_TAGS := optional
@@ -57,9 +76,19 @@ endif
 
 LOCAL_CFLAGS += -DCHARGER_SHOW_PERCENTAGE
 
-LOCAL_C_INCLUDES := bootable/recovery
+ifeq ($(strip $(LOCAL_CHARGER_NO_UI)),true)
+LOCAL_CFLAGS += -DCHARGER_NO_UI
+endif
 
-LOCAL_STATIC_LIBRARIES := libbatteryservice libbinder libminui libpng libz libutils libstdc++ libcutils liblog libm libc
+LOCAL_C_INCLUDES := bootable/recovery $(LOCAL_PATH)/include
+
+LOCAL_STATIC_LIBRARIES := libbatterymonitor libbatteryservice libbinder
+
+ifneq ($(strip $(LOCAL_CHARGER_NO_UI)),true)
+LOCAL_STATIC_LIBRARIES += libminui libpng libz
+endif
+
+LOCAL_STATIC_LIBRARIES += libutils libcutils liblog libm libc
 
 ifeq ($(strip $(BOARD_CHARGER_ENABLE_SUSPEND)),true)
 LOCAL_STATIC_LIBRARIES += libsuspend
@@ -78,6 +107,7 @@ LOCAL_POST_INSTALL_CMD := $(hide) mkdir -p $(TARGET_ROOT_OUT) \
 include $(BUILD_EXECUTABLE)
 
 
+ifneq ($(strip $(LOCAL_CHARGER_NO_UI)),true)
 define _add-charger-image
 include $$(CLEAR_VARS)
 LOCAL_MODULE := system_core_charger_$(notdir $(1))
@@ -108,3 +138,4 @@ include $(BUILD_PHONY_PACKAGE)
 
 _add-charger-image :=
 _img_modules :=
+endif # LOCAL_CHARGER_NO_UI

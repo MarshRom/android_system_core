@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#define TRACE_TAG TRACE_SERVICES
+#define TRACE_TAG SERVICES
 
 #include "sysdeps.h"
 
@@ -31,9 +31,11 @@
 #include <unistd.h>
 #endif
 
-#include <base/file.h>
-#include <base/stringprintf.h>
-#include <base/strings.h>
+#include <android-base/file.h>
+#include <android-base/parsenetaddress.h>
+#include <android-base/stringprintf.h>
+#include <android-base/strings.h>
+#include <cutils/sockets.h>
 
 #if !ADB_HOST
 #include "cutils/android_reboot.h"
@@ -42,8 +44,12 @@
 
 #include "adb.h"
 #include "adb_io.h"
+#include "adb_utils.h"
 #include "file_sync_service.h"
 #include "remount_service.h"
+#include "services.h"
+#include "shell_service.h"
+#include "sysdeps.h"
 #include "transport.h"
 
 struct stinfo {
@@ -52,13 +58,11 @@ struct stinfo {
     void *cookie;
 };
 
-
-void *service_bootstrap_func(void *x)
-{
+static void service_bootstrap_func(void* x) {
     stinfo* sti = reinterpret_cast<stinfo*>(x);
+    adb_thread_setname(android::base::StringPrintf("service %d", sti->fd));
     sti->func(sti->fd, sti->cookie);
     free(sti);
-    return 0;
 }
 
 #if !ADB_HOST
@@ -147,7 +151,7 @@ static bool reboot_service_impl(int fd, const char* arg) {
         const char* const command_file = "/cache/recovery/command";
         // Ensure /cache/recovery exists.
         if (adb_mkdir(recovery_dir, 0770) == -1 && errno != EEXIST) {
-            D("Failed to create directory '%s': %s\n", recovery_dir, strerror(errno));
+            D("Failed to create directory '%s': %s", recovery_dir, strerror(errno));
             return false;
         }
 
@@ -192,18 +196,60 @@ void reboot_service(int fd, void* arg)
     adb_close(fd);
 }
 
-void reverse_service(int fd, void* arg)
-{
-    const char* command = reinterpret_cast<const char*>(arg);
-
-    if (handle_forward_request(command, kTransportAny, NULL, fd) < 0) {
-        SendFail(fd, "not a reverse forwarding command");
+int reverse_service(const char* command) {
+    int s[2];
+    if (adb_socketpair(s)) {
+        PLOG(ERROR) << "cannot create service socket pair.";
+        return -1;
     }
-    free(arg);
-    adb_close(fd);
+    VLOG(SERVICES) << "service socketpair: " << s[0] << ", " << s[1];
+    if (handle_forward_request(command, kTransportAny, nullptr, s[1]) < 0) {
+        SendFail(s[1], "not a reverse forwarding command");
+    }
+    adb_close(s[1]);
+    return s[0];
 }
 
-#endif
+// Shell service string can look like:
+//   shell[,arg1,arg2,...]:[command]
+static int ShellService(const std::string& args, const atransport* transport) {
+    size_t delimiter_index = args.find(':');
+    if (delimiter_index == std::string::npos) {
+        LOG(ERROR) << "No ':' found in shell service arguments: " << args;
+        return -1;
+    }
+
+    const std::string service_args = args.substr(0, delimiter_index);
+    const std::string command = args.substr(delimiter_index + 1);
+
+    // Defaults:
+    //   PTY for interactive, raw for non-interactive.
+    //   No protocol.
+    //   $TERM set to "dumb".
+    SubprocessType type(command.empty() ? SubprocessType::kPty
+                                        : SubprocessType::kRaw);
+    SubprocessProtocol protocol = SubprocessProtocol::kNone;
+    std::string terminal_type = "dumb";
+
+    for (const std::string& arg : android::base::Split(service_args, ",")) {
+        if (arg == kShellServiceArgRaw) {
+            type = SubprocessType::kRaw;
+        } else if (arg == kShellServiceArgPty) {
+            type = SubprocessType::kPty;
+        } else if (arg == kShellServiceArgShellProtocol) {
+            protocol = SubprocessProtocol::kShell;
+        } else if (android::base::StartsWith(arg, "TERM=")) {
+            terminal_type = arg.substr(5);
+        } else if (!arg.empty()) {
+            // This is not an error to allow for future expansion.
+            LOG(WARNING) << "Ignoring unknown shell service argument: " << arg;
+        }
+    }
+
+    return StartSubprocess(command.c_str(), terminal_type.c_str(), type, protocol);
+}
+
+#endif  // !ADB_HOST
 
 static int create_service_thread(void (*func)(int, void *), void *cookie)
 {
@@ -222,8 +268,7 @@ static int create_service_thread(void (*func)(int, void *), void *cookie)
     sti->cookie = cookie;
     sti->fd = s[1];
 
-    adb_thread_t t;
-    if (adb_thread_create(&t, service_bootstrap_func, sti)) {
+    if (!adb_thread_create(service_bootstrap_func, sti)) {
         free(sti);
         adb_close(s[0]);
         adb_close(s[1]);
@@ -231,7 +276,7 @@ static int create_service_thread(void (*func)(int, void *), void *cookie)
         return -1;
     }
 
-    D("service thread started, %d:%d\n",s[0], s[1]);
+    D("service thread started, %d:%d",s[0], s[1]);
     return s[0];
 }
 
@@ -458,25 +503,26 @@ static const char* bu_path()
 }
 #endif
 
-int service_to_fd(const char *name)
-{
+int service_to_fd(const char* name, const atransport* transport) {
     int ret = -1;
 
     if(!strncmp(name, "tcp:", 4)) {
         int port = atoi(name + 4);
         name = strchr(name + 4, ':');
         if(name == 0) {
-            ret = socket_loopback_client(port, SOCK_STREAM);
+            std::string error;
+            ret = network_loopback_client(port, SOCK_STREAM, &error);
             if (ret >= 0)
                 disable_tcp_nagle(ret);
         } else {
 #if ADB_HOST
-            ret = socket_network_client(name + 1, port, SOCK_STREAM);
+            std::string error;
+            ret = network_connect(name + 1, port, SOCK_STREAM, 0, &error);
 #else
             return -1;
 #endif
         }
-#ifndef HAVE_WINSOCK   /* winsock doesn't implement unix domain sockets */
+#if !defined(_WIN32)   /* winsock doesn't implement unix domain sockets */
     } else if(!strncmp(name, "local:", 6)) {
         ret = socket_local_client(name + 6,
                 ANDROID_SOCKET_NAMESPACE_RESERVED, SOCK_STREAM);
@@ -497,10 +543,10 @@ int service_to_fd(const char *name)
         ret = create_service_thread(framebuffer_service, 0);
     } else if (!strncmp(name, "jdwp:", 5)) {
         ret = create_jdwp_connection_fd(atoi(name+5));
-    } else if(!HOST && !strncmp(name, "shell:", 6)) {
-        ret = create_subproc_thread(name + 6, SUBPROC_PTY);
-    } else if(!HOST && !strncmp(name, "exec:", 5)) {
-        ret = create_subproc_thread(name + 5, SUBPROC_RAW);
+    } else if(!strncmp(name, "shell", 5)) {
+        ret = ShellService(name + 5, transport);
+    } else if(!strncmp(name, "exec:", 5)) {
+        ret = StartSubprocess(name + 5, nullptr, SubprocessType::kRaw, SubprocessProtocol::kNone);
     } else if(!strncmp(name, "sync:", 5)) {
         ret = create_service_thread(file_sync_service, NULL);
     } else if(!strncmp(name, "remount:", 8)) {
@@ -514,32 +560,22 @@ int service_to_fd(const char *name)
     } else if(!strncmp(name, "unroot:", 7)) {
         ret = create_service_thread(restart_unroot_service, NULL);
     } else if(!strncmp(name, "backup:", 7)) {
-        ret = create_subproc_thread(android::base::StringPrintf("%s backup %s", bu_path(),
-                                                                (name + 7)).c_str(), SUBPROC_RAW);
+        ret = StartSubprocess(android::base::StringPrintf("/system/bin/bu backup %s",
+                                                          (name + 7)).c_str(),
+                              nullptr, SubprocessType::kRaw, SubprocessProtocol::kNone);
     } else if(!strncmp(name, "restore:", 8)) {
-        char* cmd;
-        if (asprintf(&cmd, "%s restore", bu_path()) != -1) {
-            ret = create_subproc_thread(cmd, SUBPROC_RAW);
-            free(cmd);
-        }
+        ret = StartSubprocess("/system/bin/bu restore", nullptr, SubprocessType::kRaw,
+                              SubprocessProtocol::kNone);
     } else if(!strncmp(name, "tcpip:", 6)) {
         int port;
         if (sscanf(name + 6, "%d", &port) != 1) {
-            port = 0;
+            return -1;
         }
         ret = create_service_thread(restart_tcp_service, (void *) (uintptr_t) port);
     } else if(!strncmp(name, "usb:", 4)) {
         ret = create_service_thread(restart_usb_service, NULL);
     } else if (!strncmp(name, "reverse:", 8)) {
-        char* cookie = strdup(name + 8);
-        if (cookie == NULL) {
-            ret = -1;
-        } else {
-            ret = create_service_thread(reverse_service, cookie);
-            if (ret < 0) {
-                free(cookie);
-            }
-        }
+        ret = reverse_service(name + 8);
     } else if(!strncmp(name, "disable-verity:", 15)) {
         ret = create_service_thread(set_verity_enabled_state_service, (void*)0);
     } else if(!strncmp(name, "enable-verity:", 15)) {
@@ -554,63 +590,76 @@ int service_to_fd(const char *name)
 
 #if ADB_HOST
 struct state_info {
-    transport_type transport;
-    char* serial;
-    int state;
+    TransportType transport_type;
+    std::string serial;
+    ConnectionState state;
 };
 
-static void wait_for_state(int fd, void* cookie)
-{
-    state_info* sinfo = reinterpret_cast<state_info*>(cookie);
+static void wait_for_state(int fd, void* data) {
+    std::unique_ptr<state_info> sinfo(reinterpret_cast<state_info*>(data));
 
-    D("wait_for_state %d\n", sinfo->state);
+    D("wait_for_state %d", sinfo->state);
 
-    std::string error_msg = "unknown error";
-    atransport* t = acquire_one_transport(sinfo->state, sinfo->transport, sinfo->serial, &error_msg);
-    if (t != 0) {
-        SendOkay(fd);
-    } else {
-        SendFail(fd, error_msg);
-    }
+    while (true) {
+        bool is_ambiguous = false;
+        std::string error = "unknown error";
+        const char* serial = sinfo->serial.length() ? sinfo->serial.c_str() : NULL;
+        atransport* t = acquire_one_transport(sinfo->transport_type, serial, &is_ambiguous, &error);
+        if (t != nullptr && t->connection_state == sinfo->state) {
+            SendOkay(fd);
+            break;
+        } else if (!is_ambiguous) {
+            adb_pollfd pfd = {.fd = fd, .events = POLLIN };
+            int rc = adb_poll(&pfd, 1, 1000);
+            if (rc < 0) {
+                SendFail(fd, error);
+                break;
+            } else if (rc > 0 && (pfd.revents & POLLHUP) != 0) {
+                // The other end of the socket is closed, probably because the other side was
+                // terminated, bail out.
+                break;
+            }
 
-    if (sinfo->serial)
-        free(sinfo->serial);
-    free(sinfo);
-    adb_close(fd);
-    D("wait_for_state is done\n");
-}
-
-static void connect_device(const std::string& host, std::string* response) {
-    if (host.empty()) {
-        *response = "empty host name";
-        return;
-    }
-
-    std::vector<std::string> pieces = android::base::Split(host, ":");
-    const std::string& hostname = pieces[0];
-
-    int port = DEFAULT_ADB_LOCAL_TRANSPORT_PORT;
-    if (pieces.size() > 1) {
-        if (sscanf(pieces[1].c_str(), "%d", &port) != 1) {
-            *response = android::base::StringPrintf("bad port number %s", pieces[1].c_str());
-            return;
+            // Try again...
+        } else {
+            SendFail(fd, error);
+            break;
         }
     }
 
-    // This may look like we're putting 'host' back together,
-    // but we're actually inserting the default port if necessary.
-    std::string serial = android::base::StringPrintf("%s:%d", hostname.c_str(), port);
+    adb_close(fd);
+    D("wait_for_state is done");
+}
 
-    int fd = socket_network_client_timeout(hostname.c_str(), port, SOCK_STREAM, 10);
-    if (fd < 0) {
-        *response = android::base::StringPrintf("unable to connect to %s:%d",
-                                                hostname.c_str(), port);
+static void connect_device(const std::string& address, std::string* response) {
+    if (address.empty()) {
+        *response = "empty address";
         return;
     }
 
-    D("client: connected on remote on fd %d\n", fd);
+    std::string serial;
+    std::string host;
+    int port = DEFAULT_ADB_LOCAL_TRANSPORT_PORT;
+    if (!android::base::ParseNetAddress(address, &host, &port, &serial, response)) {
+        return;
+    }
+
+    std::string error;
+    int fd = network_connect(host.c_str(), port, SOCK_STREAM, 10, &error);
+    if (fd == -1) {
+        *response = android::base::StringPrintf("unable to connect to %s: %s",
+                                                serial.c_str(), error.c_str());
+        return;
+    }
+
+    D("client: connected %s remote on fd %d", serial.c_str(), fd);
     close_on_exec(fd);
     disable_tcp_nagle(fd);
+
+    // Send a TCP keepalive ping to the device every second so we can detect disconnects.
+    if (!set_tcp_keepalive(fd, 1)) {
+        D("warning: failed to configure TCP keepalives (%s)", strerror(errno));
+    }
 
     int ret = register_socket_transport(fd, serial.c_str(), port, 0);
     if (ret < 0) {
@@ -658,25 +707,25 @@ void connect_emulator(const std::string& port_spec, std::string* response) {
     }
 
     // Preconditions met, try to connect to the emulator.
-    if (!local_connect_arbitrary_ports(console_port, adb_port)) {
+    std::string error;
+    if (!local_connect_arbitrary_ports(console_port, adb_port, &error)) {
         *response = android::base::StringPrintf("Connected to emulator on ports %d,%d",
                                                 console_port, adb_port);
     } else {
-        *response = android::base::StringPrintf("Could not connect to emulator on ports %d,%d",
-                                                console_port, adb_port);
+        *response = android::base::StringPrintf("Could not connect to emulator on ports %d,%d: %s",
+                                                console_port, adb_port, error.c_str());
     }
 }
 
-static void connect_service(int fd, void* cookie)
-{
-    char *host = reinterpret_cast<char*>(cookie);
-
+static void connect_service(int fd, void* data) {
+    char* host = reinterpret_cast<char*>(data);
     std::string response;
     if (!strncmp(host, "emu:", 4)) {
         connect_emulator(host + 4, &response);
     } else {
         connect_device(host, &response);
     }
+    free(host);
 
     // Send response for emulator and device
     SendProtocolString(fd, response);
@@ -685,23 +734,32 @@ static void connect_service(int fd, void* cookie)
 #endif
 
 #if ADB_HOST
-asocket*  host_service_to_socket(const char*  name, const char *serial)
-{
+asocket* host_service_to_socket(const char* name, const char* serial) {
     if (!strcmp(name,"track-devices")) {
         return create_device_tracker();
-    } else if (!strncmp(name, "wait-for-", strlen("wait-for-"))) {
-        auto sinfo = reinterpret_cast<state_info*>(malloc(sizeof(state_info)));
+    } else if (android::base::StartsWith(name, "wait-for-")) {
+        name += strlen("wait-for-");
+
+        std::unique_ptr<state_info> sinfo(new state_info);
         if (sinfo == nullptr) {
             fprintf(stderr, "couldn't allocate state_info: %s", strerror(errno));
-            return NULL;
+            return nullptr;
         }
 
-        if (serial)
-            sinfo->serial = strdup(serial);
-        else
-            sinfo->serial = NULL;
+        if (serial) sinfo->serial = serial;
 
-        name += strlen("wait-for-");
+        if (android::base::StartsWith(name, "local")) {
+            name += strlen("local");
+            sinfo->transport_type = kTransportLocal;
+        } else if (android::base::StartsWith(name, "usb")) {
+            name += strlen("usb");
+            sinfo->transport_type = kTransportUsb;
+        } else if (android::base::StartsWith(name, "any")) {
+            name += strlen("any");
+            sinfo->transport_type = kTransportAny;
+        } else {
+            return nullptr;
+        }
 
         if (!strncmp(name, "local", strlen("local"))) {
             sinfo->transport = kTransportLocal;
@@ -721,16 +779,23 @@ asocket*  host_service_to_socket(const char*  name, const char *serial)
         } else if (!strncmp(name, "online", strlen("online"))) {
             sinfo->transport = kTransportAny;
             sinfo->state = CS_ONLINE;
+        } else if (!strcmp(name, "-device")) {
+            sinfo->state = kCsDevice;
+        } else if (!strcmp(name, "-recovery")) {
+            sinfo->state = kCsRecovery;
+        } else if (!strcmp(name, "-sideload")) {
+            sinfo->state = kCsSideload;
+        } else if (!strcmp(name, "-bootloader")) {
+            sinfo->state = kCsBootloader;
         } else {
-            free(sinfo);
-            return NULL;
+            return nullptr;
         }
 
-        int fd = create_service_thread(wait_for_state, sinfo);
+        int fd = create_service_thread(wait_for_state, sinfo.release());
         return create_local_socket(fd);
     } else if (!strncmp(name, "connect:", 8)) {
-        const char *host = name + 8;
-        int fd = create_service_thread(connect_service, (void *)host);
+        char* host = strdup(name + 8);
+        int fd = create_service_thread(connect_service, host);
         return create_local_socket(fd);
     }
     return NULL;
